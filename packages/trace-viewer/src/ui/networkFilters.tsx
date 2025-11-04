@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+import * as React from 'react';
 import './networkFilters.css';
+import { ToolbarButton } from '@web/components/toolbarButton';
 
 const resourceTypes = ['Fetch', 'HTML', 'JS', 'CSS', 'Font', 'Image'] as const;
 export type ResourceType = typeof resourceTypes[number];
@@ -26,9 +28,10 @@ export type FilterState = {
 
 export const defaultFilterState: FilterState = { searchValue: '', resourceTypes: new Set() };
 
-export const NetworkFilters = ({ filterState, onFilterStateChange }: {
+export const NetworkFilters = ({ filterState, onFilterStateChange, onDownloadHAR }: {
   filterState: FilterState,
   onFilterStateChange: (filterState: FilterState) => void,
+  onDownloadHAR: () => void,
 }) => {
   return (
     <div className='network-filters'>
@@ -70,6 +73,13 @@ export const NetworkFilters = ({ filterState, onFilterStateChange }: {
           </div>
         ))}
       </div>
+
+      <ToolbarButton
+        icon='download'
+        title='Download HAR'
+        onClick={onDownloadHAR}
+        ariaLabel='Download network logs as HAR'
+      />
     </div>
   );
 };

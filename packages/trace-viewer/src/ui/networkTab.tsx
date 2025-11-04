@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import type { Entry } from '@trace/har';
+import type { Entry, HARFile } from '@trace/har';
 import * as React from 'react';
 import type { Boundaries } from './geometry';
 import './networkTab.css';
@@ -64,6 +64,19 @@ export function useNetworkTabModel(model: MultiTraceModel | undefined, selectedT
   return { resources, contextIdMap };
 }
 
+export function generateHAR(resources: Entry[]): HARFile {
+  return {
+    log: {
+      version: '1.2',
+      creator: {
+        name: 'Playwright',
+        version: '1.0.0',
+      },
+      entries: resources,
+    },
+  };
+}
+
 export const NetworkTab: React.FunctionComponent<{
   boundaries: Boundaries,
   networkModel: NetworkTabModel,
@@ -90,6 +103,20 @@ export const NetworkTab: React.FunctionComponent<{
     setSelectedEntry(undefined);
   }, []);
 
+  const onDownloadHAR = React.useCallback(() => {
+    const har = generateHAR(networkModel.resources);
+    const harJson = JSON.stringify(har, null, 2);
+    const blob = new Blob([harJson], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `network-logs-${new Date().toISOString().replace(/[:.]/g, '-')}.har`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, [networkModel.resources]);
+
   if (!networkModel.resources.length)
     return <PlaceholderPanel text='No network calls' />;
 
@@ -111,7 +138,7 @@ export const NetworkTab: React.FunctionComponent<{
     setSorting={setSorting}
   />;
   return <>
-    <NetworkFilters filterState={filterState} onFilterStateChange={onFilterStateChange} />
+    <NetworkFilters filterState={filterState} onFilterStateChange={onFilterStateChange} onDownloadHAR={onDownloadHAR} />
     {!selectedEntry && grid}
     {selectedEntry &&
       <SplitView

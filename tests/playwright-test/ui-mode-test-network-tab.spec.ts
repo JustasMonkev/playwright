@@ -241,3 +241,57 @@ test('should not duplicate network entries from beforeAll', {
   await page.getByText('Network', { exact: true }).click();
   await expect(page.getByRole('list', { name: 'Network requests' }).getByText('empty.html')).toHaveCount(1);
 });
+
+test('should download network logs as HAR', async ({ runUITest, server, context }) => {
+  server.setRoute('/api/endpoint', (_, res) => res.setHeader('Content-Type', 'application/json').end('{"result": "ok"}'));
+
+  const { page } = await runUITest({
+    'network-tab.test.ts': `
+      import { test, expect } from '@playwright/test';
+      test('network tab test', async ({ page }) => {
+        await page.goto('${server.PREFIX}/network-tab/network.html');
+        await page.evaluate(() => (window as any).donePromise);
+      });
+    `,
+  });
+
+  await page.getByText('network tab test').dblclick();
+  await page.getByText('Network', { exact: true }).click();
+
+  // Wait for network resources to be displayed
+  const networkItems = page.getByRole('list', { name: 'Network requests' }).getByRole('listitem');
+  await expect(networkItems.first()).toBeVisible();
+
+  // Set up download promise before clicking
+  const downloadPromise = page.waitForEvent('download');
+
+  // Click the download button
+  await page.getByRole('button', { name: 'Download network logs as HAR' }).click();
+
+  // Wait for download
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toMatch(/^network-logs-.*\.har$/);
+
+  // Verify the HAR file contents
+  const path = await download.path();
+  const fs = await import('fs');
+  const harContent = fs.readFileSync(path, 'utf-8');
+  const har = JSON.parse(harContent);
+
+  // Verify HAR structure
+  expect(har.log).toBeDefined();
+  expect(har.log.version).toBe('1.2');
+  expect(har.log.creator).toBeDefined();
+  expect(har.log.creator.name).toBe('Playwright');
+  expect(har.log.entries).toBeDefined();
+  expect(Array.isArray(har.log.entries)).toBe(true);
+  expect(har.log.entries.length).toBeGreaterThan(0);
+
+  // Verify entries have required HAR fields
+  const entry = har.log.entries[0];
+  expect(entry.request).toBeDefined();
+  expect(entry.response).toBeDefined();
+  expect(entry.request.method).toBeDefined();
+  expect(entry.request.url).toBeDefined();
+  expect(entry.response.status).toBeDefined();
+});
