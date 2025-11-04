@@ -242,7 +242,7 @@ test('should not duplicate network entries from beforeAll', {
   await expect(page.getByRole('list', { name: 'Network requests' }).getByText('empty.html')).toHaveCount(1);
 });
 
-test('should download network logs as HAR', async ({ runUITest, server, context }) => {
+test('should download network logs as HAR', async ({ runUITest, server }) => {
   server.setRoute('/api/endpoint', (_, res) => res.setHeader('Content-Type', 'application/json').end('{"result": "ok"}'));
 
   const { page } = await runUITest({
