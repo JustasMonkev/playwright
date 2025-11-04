@@ -64,7 +64,12 @@ export function useNetworkTabModel(model: MultiTraceModel | undefined, selectedT
   return { resources, contextIdMap };
 }
 
-export function generateHAR(resources: Entry[]): HARFile {
+function harFileName(): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `network-${timestamp}.har`;
+}
+
+export function generateHAR(entries: Entry[]): HARFile {
   return {
     log: {
       version: '1.2',
@@ -72,7 +77,7 @@ export function generateHAR(resources: Entry[]): HARFile {
         name: 'Playwright',
         version: '1.0.0',
       },
-      entries: resources,
+      entries,
     },
   };
 }
@@ -103,18 +108,18 @@ export const NetworkTab: React.FunctionComponent<{
     setSelectedEntry(undefined);
   }, []);
 
-  const onDownloadHAR = React.useCallback(() => {
-    const har = generateHAR(networkModel.resources);
-    const harJson = JSON.stringify(har, null, 2);
-    const blob = new Blob([harJson], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `network-logs-${new Date().toISOString().replace(/[:.]/g, '-')}.har`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const onExportHAR = React.useCallback(() => {
+    const harFile = generateHAR(networkModel.resources);
+    const harFileContent = JSON.stringify(harFile, null, 2);
+    const blob = new Blob([harFileContent], { type: 'application/json' });
+    const blobUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = harFileName();
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(blobUrl);
   }, [networkModel.resources]);
 
   if (!networkModel.resources.length)
@@ -138,7 +143,7 @@ export const NetworkTab: React.FunctionComponent<{
     setSorting={setSorting}
   />;
   return <>
-    <NetworkFilters filterState={filterState} onFilterStateChange={onFilterStateChange} onDownloadHAR={onDownloadHAR} />
+    <NetworkFilters filterState={filterState} onFilterStateChange={onFilterStateChange} onExportHAR={onExportHAR} />
     {!selectedEntry && grid}
     {selectedEntry &&
       <SplitView

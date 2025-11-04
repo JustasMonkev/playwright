@@ -28,10 +28,10 @@ export type FilterState = {
 
 export const defaultFilterState: FilterState = { searchValue: '', resourceTypes: new Set() };
 
-export const NetworkFilters = ({ filterState, onFilterStateChange, onDownloadHAR }: {
+export const NetworkFilters = ({ filterState, onFilterStateChange, onExportHAR }: {
   filterState: FilterState,
   onFilterStateChange: (filterState: FilterState) => void,
-  onDownloadHAR: () => void,
+  onExportHAR: () => void,
 }) => {
   return (
     <div className='network-filters'>
@@ -76,9 +76,9 @@ export const NetworkFilters = ({ filterState, onFilterStateChange, onDownloadHAR
 
       <ToolbarButton
         icon='download'
-        title='Download HAR'
-        onClick={onDownloadHAR}
-        ariaLabel='Download network logs as HAR'
+        title='Export HAR'
+        onClick={onExportHAR}
+        ariaLabel='Export network logs as HAR'
       />
     </div>
   );

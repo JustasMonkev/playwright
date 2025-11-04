@@ -242,7 +242,7 @@ test('should not duplicate network entries from beforeAll', {
   await expect(page.getByRole('list', { name: 'Network requests' }).getByText('empty.html')).toHaveCount(1);
 });
 
-test('should download network logs as HAR', async ({ runUITest, server }) => {
+test('should export network logs as HAR', async ({ runUITest, server }) => {
   server.setRoute('/api/endpoint', (_, res) => res.setHeader('Content-Type', 'application/json').end('{"result": "ok"}'));
 
   const { page } = await runUITest({
@@ -265,30 +265,30 @@ test('should download network logs as HAR', async ({ runUITest, server }) => {
   // Set up download promise before clicking
   const downloadPromise = page.waitForEvent('download');
 
-  // Click the download button
-  await page.getByRole('button', { name: 'Download network logs as HAR' }).click();
+  // Click the export button
+  await page.getByRole('button', { name: 'Export network logs as HAR' }).click();
 
   // Wait for download
   const download = await downloadPromise;
-  expect(download.suggestedFilename()).toMatch(/^network-logs-.*\.har$/);
+  expect(download.suggestedFilename()).toMatch(/^network-.*\.har$/);
 
   // Verify the HAR file contents
   const path = await download.path();
   const fs = await import('fs');
-  const harContent = fs.readFileSync(path, 'utf-8');
-  const har = JSON.parse(harContent);
+  const harFileContent = fs.readFileSync(path, 'utf-8');
+  const harFile = JSON.parse(harFileContent);
 
   // Verify HAR structure
-  expect(har.log).toBeDefined();
-  expect(har.log.version).toBe('1.2');
-  expect(har.log.creator).toBeDefined();
-  expect(har.log.creator.name).toBe('Playwright');
-  expect(har.log.entries).toBeDefined();
-  expect(Array.isArray(har.log.entries)).toBe(true);
-  expect(har.log.entries.length).toBeGreaterThan(0);
+  expect(harFile.log).toBeDefined();
+  expect(harFile.log.version).toBe('1.2');
+  expect(harFile.log.creator).toBeDefined();
+  expect(harFile.log.creator.name).toBe('Playwright');
+  expect(harFile.log.entries).toBeDefined();
+  expect(Array.isArray(harFile.log.entries)).toBe(true);
+  expect(harFile.log.entries.length).toBeGreaterThan(0);
 
   // Verify entries have required HAR fields
-  const entry = har.log.entries[0];
+  const entry = harFile.log.entries[0];
   expect(entry.request).toBeDefined();
   expect(entry.response).toBeDefined();
   expect(entry.request.method).toBeDefined();
