@@ -14,13 +14,18 @@
  * limitations under the License.
  */
 
-import { expect, test } from './ui-mode-fixtures';
+import { expect, test } from "./ui-mode-fixtures";
 
-test('should filter network requests by resource type', async ({ runUITest, server }) => {
-  server.setRoute('/api/endpoint', (_, res) => res.setHeader('Content-Type', 'application/json').end());
+test("should filter network requests by resource type", async ({
+  runUITest,
+  server,
+}) => {
+  server.setRoute("/api/endpoint", (_, res) =>
+    res.setHeader("Content-Type", "application/json").end(),
+  );
 
   const { page } = await runUITest({
-    'network-tab.test.ts': `
+    "network-tab.test.ts": `
       import { test, expect } from '@playwright/test';
       test('network tab test', async ({ page }) => {
         await page.goto('${server.PREFIX}/network-tab/network.html');
@@ -29,41 +34,48 @@ test('should filter network requests by resource type', async ({ runUITest, serv
     `,
   });
 
-  await page.getByText('network tab test').dblclick();
-  await page.getByText('Network', { exact: true }).click();
+  await page.getByText("network tab test").dblclick();
+  await page.getByText("Network", { exact: true }).click();
 
-  const networkItems = page.getByRole('list', { name: 'Network requests' }).getByRole('listitem');
+  const networkItems = page
+    .getByRole("list", { name: "Network requests" })
+    .getByRole("listitem");
 
-  await page.getByText('JS', { exact: true }).click();
+  await page.getByText("JS", { exact: true }).click();
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('script.js')).toBeVisible();
+  await expect(networkItems.getByText("script.js")).toBeVisible();
 
-  await page.getByText('CSS', { exact: true }).click();
+  await page.getByText("CSS", { exact: true }).click();
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('style.css')).toBeVisible();
+  await expect(networkItems.getByText("style.css")).toBeVisible();
 
-  await page.getByText('Image', { exact: true }).click();
+  await page.getByText("Image", { exact: true }).click();
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('image.png')).toBeVisible();
+  await expect(networkItems.getByText("image.png")).toBeVisible();
 
-  await page.getByText('Fetch', { exact: true }).click();
+  await page.getByText("Fetch", { exact: true }).click();
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('endpoint')).toBeVisible();
+  await expect(networkItems.getByText("endpoint")).toBeVisible();
 
-  await page.getByText('HTML', { exact: true }).click();
+  await page.getByText("HTML", { exact: true }).click();
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('network.html')).toBeVisible();
+  await expect(networkItems.getByText("network.html")).toBeVisible();
 
-  await page.getByText('Font', { exact: true }).click();
+  await page.getByText("Font", { exact: true }).click();
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('font.woff2')).toBeVisible();
+  await expect(networkItems.getByText("font.woff2")).toBeVisible();
 });
 
-test('should filter network requests by multiple resource types', async ({ runUITest, server }) => {
-  server.setRoute('/api/endpoint', (_, res) => res.setHeader('Content-Type', 'application/json').end());
+test("should filter network requests by multiple resource types", async ({
+  runUITest,
+  server,
+}) => {
+  server.setRoute("/api/endpoint", (_, res) =>
+    res.setHeader("Content-Type", "application/json").end(),
+  );
 
   const { page } = await runUITest({
-    'network-tab.test.ts': `
+    "network-tab.test.ts": `
       import { test, expect } from '@playwright/test';
       test('network tab test', async ({ page }) => {
         await page.goto('${server.PREFIX}/network-tab/network.html');
@@ -72,37 +84,45 @@ test('should filter network requests by multiple resource types', async ({ runUI
     `,
   });
 
-  await page.getByText('network tab test').dblclick();
-  await page.getByText('Network', { exact: true }).click();
+  await page.getByText("network tab test").dblclick();
+  await page.getByText("Network", { exact: true }).click();
 
-  const networkItems = page.getByRole('list', { name: 'Network requests' }).getByRole('listitem');
+  const networkItems = page
+    .getByRole("list", { name: "Network requests" })
+    .getByRole("listitem");
   await expect(networkItems).toHaveCount(9);
 
-  await page.getByText('JS', { exact: true }).click();
+  await page.getByText("JS", { exact: true }).click();
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('script.js')).toBeVisible();
+  await expect(networkItems.getByText("script.js")).toBeVisible();
 
-  await page.getByText('CSS', { exact: true }).click({ modifiers: ['ControlOrMeta'] });
-  await expect(networkItems.getByText('script.js')).toBeVisible();
-  await expect(networkItems.getByText('style.css')).toBeVisible();
+  await page
+    .getByText("CSS", { exact: true })
+    .click({ modifiers: ["ControlOrMeta"] });
+  await expect(networkItems.getByText("script.js")).toBeVisible();
+  await expect(networkItems.getByText("style.css")).toBeVisible();
   await expect(networkItems).toHaveCount(2);
 
-  await page.getByText('Image', { exact: true }).click({ modifiers: ['ControlOrMeta'] });
-  await expect(networkItems.getByText('image.png')).toBeVisible();
+  await page
+    .getByText("Image", { exact: true })
+    .click({ modifiers: ["ControlOrMeta"] });
+  await expect(networkItems.getByText("image.png")).toBeVisible();
   await expect(networkItems).toHaveCount(3);
 
-  await page.getByText('CSS', { exact: true }).click({ modifiers: ['ControlOrMeta'] });
+  await page
+    .getByText("CSS", { exact: true })
+    .click({ modifiers: ["ControlOrMeta"] });
   await expect(networkItems).toHaveCount(2);
-  await expect(networkItems.getByText('script.js')).toBeVisible();
-  await expect(networkItems.getByText('image.png')).toBeVisible();
+  await expect(networkItems.getByText("script.js")).toBeVisible();
+  await expect(networkItems.getByText("image.png")).toBeVisible();
 
-  await page.getByText('All', { exact: true }).click();
+  await page.getByText("All", { exact: true }).click();
   await expect(networkItems).toHaveCount(9);
 });
 
-test('should filter network requests by url', async ({ runUITest, server }) => {
+test("should filter network requests by url", async ({ runUITest, server }) => {
   const { page } = await runUITest({
-    'network-tab.test.ts': `
+    "network-tab.test.ts": `
       import { test, expect } from '@playwright/test';
       test('network tab test', async ({ page }) => {
         await page.goto('${server.PREFIX}/network-tab/network.html');
@@ -111,35 +131,37 @@ test('should filter network requests by url', async ({ runUITest, server }) => {
     `,
   });
 
-  await page.getByText('network tab test').dblclick();
-  await page.getByText('Network', { exact: true }).click();
+  await page.getByText("network tab test").dblclick();
+  await page.getByText("Network", { exact: true }).click();
 
-  const networkItems = page.getByRole('list', { name: 'Network requests' }).getByRole('listitem');
+  const networkItems = page
+    .getByRole("list", { name: "Network requests" })
+    .getByRole("listitem");
 
-  await page.getByPlaceholder('Filter network').fill('script.');
+  await page.getByPlaceholder("Filter network").fill("script.");
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('script.js')).toBeVisible();
+  await expect(networkItems.getByText("script.js")).toBeVisible();
 
-  await page.getByPlaceholder('Filter network').fill('png');
+  await page.getByPlaceholder("Filter network").fill("png");
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('image.png')).toBeVisible();
+  await expect(networkItems.getByText("image.png")).toBeVisible();
 
-  await page.getByPlaceholder('Filter network').fill('api/');
+  await page.getByPlaceholder("Filter network").fill("api/");
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('endpoint')).toBeVisible();
+  await expect(networkItems.getByText("endpoint")).toBeVisible();
 
-  await page.getByPlaceholder('Filter network').fill('End');
+  await page.getByPlaceholder("Filter network").fill("End");
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('endpoint')).toBeVisible();
+  await expect(networkItems.getByText("endpoint")).toBeVisible();
 
-  await page.getByPlaceholder('Filter network').fill('FON');
+  await page.getByPlaceholder("Filter network").fill("FON");
   await expect(networkItems).toHaveCount(1);
-  await expect(networkItems.getByText('font.woff2')).toBeVisible();
+  await expect(networkItems.getByText("font.woff2")).toBeVisible();
 });
 
-test('should format JSON request body', async ({ runUITest, server }) => {
+test("should format JSON request body", async ({ runUITest, server }) => {
   const { page } = await runUITest({
-    'network-tab.test.ts': `
+    "network-tab.test.ts": `
       import { test, expect } from '@playwright/test';
       test('network tab test', async ({ page }) => {
         await page.goto('${server.PREFIX}/network-tab/network.html');
@@ -148,41 +170,50 @@ test('should format JSON request body', async ({ runUITest, server }) => {
     `,
   });
 
-  await page.getByText('network tab test').dblclick();
-  await page.getByText('Network', { exact: true }).click();
+  await page.getByText("network tab test").dblclick();
+  await page.getByText("Network", { exact: true }).click();
 
-  await page.getByText('post-data-1').click();
+  await page.getByText("post-data-1").click();
 
-  await expect(page.locator('.CodeMirror-code .CodeMirror-line')).toHaveText([
-    '{',
-    '  "data": {',
-    '    "key": "value",',
-    '    "array": [',
-    '      "value-1",',
-    '      "value-2"',
-    '    ]',
-    '  }',
-    '}',
-  ], { useInnerText: true });
+  await expect(page.locator(".CodeMirror-code .CodeMirror-line")).toHaveText(
+    [
+      "{",
+      '  "data": {',
+      '    "key": "value",',
+      '    "array": [',
+      '      "value-1",',
+      '      "value-2"',
+      "    ]",
+      "  }",
+      "}",
+    ],
+    { useInnerText: true },
+  );
 
-  await page.getByText('post-data-2').click();
+  await page.getByText("post-data-2").click();
 
-  await expect(page.locator('.CodeMirror-code .CodeMirror-line')).toHaveText([
-    '{',
-    '  "data": {',
-    '    "key": "value",',
-    '    "array": [',
-    '      "value-1",',
-    '      "value-2"',
-    '    ]',
-    '  }',
-    '}',
-  ], { useInnerText: true });
+  await expect(page.locator(".CodeMirror-code .CodeMirror-line")).toHaveText(
+    [
+      "{",
+      '  "data": {',
+      '    "key": "value",',
+      '    "array": [',
+      '      "value-1",',
+      '      "value-2"',
+      "    ]",
+      "  }",
+      "}",
+    ],
+    { useInnerText: true },
+  );
 });
 
-test('should display list of query parameters (only if present)', async ({ runUITest, server }) => {
+test("should display list of query parameters (only if present)", async ({
+  runUITest,
+  server,
+}) => {
   const { page } = await runUITest({
-    'network-tab.test.ts': `
+    "network-tab.test.ts": `
       import { test, expect } from '@playwright/test';
       test('network tab test', async ({ page }) => {
         await page.goto('${server.PREFIX}/network-tab/network.html');
@@ -191,32 +222,41 @@ test('should display list of query parameters (only if present)', async ({ runUI
     `,
   });
 
-  await page.getByText('network tab test').dblclick();
-  await page.getByText('Network', { exact: true }).click();
+  await page.getByText("network tab test").dblclick();
+  await page.getByText("Network", { exact: true }).click();
 
-  await page.getByText('call-with-query-params').click();
+  await page.getByText("call-with-query-params").click();
 
-  await expect(page.getByText('Query String Parameters')).toBeVisible();
-  await expect(page.getByText('param1: value1')).toBeVisible();
-  await expect(page.getByText('param1: value2')).toBeVisible();
-  await expect(page.getByText('param2: value2')).toBeVisible();
+  await expect(page.getByText("Query String Parameters")).toBeVisible();
+  await expect(page.getByText("param1: value1")).toBeVisible();
+  await expect(page.getByText("param1: value2")).toBeVisible();
+  await expect(page.getByText("param2: value2")).toBeVisible();
 
-  await page.getByText('endpoint').click();
+  await page.getByText("endpoint").click();
 
-  await expect(page.getByText('Query String Parameters')).not.toBeVisible();
+  await expect(page.getByText("Query String Parameters")).not.toBeVisible();
 });
 
-test('should not duplicate network entries from beforeAll', {
-  annotation: [
-    { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/34404' },
-    { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/33106' },
-  ]
-}, async ({ runUITest, server }) => {
-  const { page } = await runUITest({
-    'playwright.config.ts': `
+test(
+  "should not duplicate network entries from beforeAll",
+  {
+    annotation: [
+      {
+        type: "issue",
+        description: "https://github.com/microsoft/playwright/issues/34404",
+      },
+      {
+        type: "issue",
+        description: "https://github.com/microsoft/playwright/issues/33106",
+      },
+    ],
+  },
+  async ({ runUITest, server }) => {
+    const { page } = await runUITest({
+      "playwright.config.ts": `
       module.exports = { use: { trace: 'on' } };
     `,
-    'a.spec.ts': `
+      "a.spec.ts": `
       import { test as base, expect, request, type APIRequestContext } from '@playwright/test';
 
       const test = base.extend<{}, { apiRequest: APIRequestContext }>({
@@ -235,18 +275,25 @@ test('should not duplicate network entries from beforeAll', {
 
       test.afterAll(async ({ apiRequest }) => { });
     `,
-  });
+    });
 
-  await page.getByText('first test').dblclick();
-  await page.getByText('Network', { exact: true }).click();
-  await expect(page.getByRole('list', { name: 'Network requests' }).getByText('empty.html')).toHaveCount(1);
-});
+    await page.getByText("first test").dblclick();
+    await page.getByText("Network", { exact: true }).click();
+    await expect(
+      page
+        .getByRole("list", { name: "Network requests" })
+        .getByText("empty.html"),
+    ).toHaveCount(1);
+  },
+);
 
-test('should export network logs as HAR', async ({ runUITest, server }) => {
-  server.setRoute('/api/endpoint', (_, res) => res.setHeader('Content-Type', 'application/json').end('{"result": "ok"}'));
+test("should export network logs as HAR", async ({ runUITest, server }) => {
+  server.setRoute("/api/endpoint", (_, res) =>
+    res.setHeader("Content-Type", "application/json").end('{"result": "ok"}'),
+  );
 
   const { page } = await runUITest({
-    'network-tab.test.ts': `
+    "network-tab.test.ts": `
       import { test, expect } from '@playwright/test';
       test('network tab test', async ({ page }) => {
         await page.goto('${server.PREFIX}/network-tab/network.html');
@@ -255,18 +302,22 @@ test('should export network logs as HAR', async ({ runUITest, server }) => {
     `,
   });
 
-  await page.getByText('network tab test').dblclick();
-  await page.getByText('Network', { exact: true }).click();
+  await page.getByText("network tab test").dblclick();
+  await page.getByText("Network", { exact: true }).click();
 
   // Wait for network resources to be displayed
-  const networkItems = page.getByRole('list', { name: 'Network requests' }).getByRole('listitem');
+  const networkItems = page
+    .getByRole("list", { name: "Network requests" })
+    .getByRole("listitem");
   await expect(networkItems.first()).toBeVisible();
 
   // Set up download promise before clicking
-  const downloadPromise = page.waitForEvent('download');
+  const downloadPromise = page.waitForEvent("download");
 
   // Click the export button
-  await page.getByRole('button', { name: 'Export network logs as HAR' }).click();
+  await page
+    .getByRole("button", { name: "Export network logs as HAR" })
+    .click();
 
   // Wait for download
   const download = await downloadPromise;
@@ -274,15 +325,15 @@ test('should export network logs as HAR', async ({ runUITest, server }) => {
 
   // Verify the HAR file contents
   const path = await download.path();
-  const fs = await import('fs');
-  const harFileContent = fs.readFileSync(path, 'utf-8');
+  const fs = await import("fs");
+  const harFileContent = fs.readFileSync(path, "utf-8");
   const harFile = JSON.parse(harFileContent);
 
   // Verify HAR structure
   expect(harFile.log).toBeDefined();
-  expect(harFile.log.version).toBe('1.2');
+  expect(harFile.log.version).toBe("1.2");
   expect(harFile.log.creator).toBeDefined();
-  expect(harFile.log.creator.name).toBe('Playwright');
+  expect(harFile.log.creator.name).toBe("Playwright");
   expect(harFile.log.entries).toBeDefined();
   expect(Array.isArray(harFile.log.entries)).toBe(true);
   expect(harFile.log.entries.length).toBeGreaterThan(0);
