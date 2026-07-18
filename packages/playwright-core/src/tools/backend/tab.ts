@@ -120,6 +120,8 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   private _modalStates: ModalState[] = [];
   private _pdf: PdfDocument | undefined;
   private _mainFrameUrl: string;
+  private _previousMainFrameUrl: string = 'about:blank';
+  private _pdfProbedUrl: string | undefined;
   private _initializedPromise: Promise<void>;
   private _recentEventEntries: EventEntry[] = [];
   private _consoleLog: LogFile;
@@ -287,9 +289,16 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     // Attachments trigger a download instead of committing a navigation.
     const disposition = response.headers()['content-disposition'] ?? '';
     if (contentType.includes('application/pdf') && !disposition.toLowerCase().startsWith('attachment'))
-      this._pdf = { url: response.url(), method: response.request().method(), canRestore: this._mainFrameUrl !== 'about:blank' };
+      this._pdf = { url: response.url(), method: response.request().method(), canRestore: this._canRestoreFrom(this._mainFrameUrl, response.url()) };
     else
       this._pdf = undefined;
+  }
+
+  // There is an application page to restore only when the PDF displaced a real
+  // page at a different url - a same-url replacement (e.g. a reload that now
+  // serves a PDF) consumed the application's history entry.
+  private _canRestoreFrom(previousUrl: string, pdfUrl: string): boolean {
+    return previousUrl !== 'about:blank' && urlWithoutFragment(previousUrl) !== urlWithoutFragment(pdfUrl);
   }
 
   // A PDF response that never committed (e.g. one that triggered a download)
@@ -308,13 +317,19 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     // main frame navigation to any other url means the PDF is gone.
     if (this._pdf && urlWithoutFragment(frame.url()) !== urlWithoutFragment(this._pdf.url))
       this._pdf = undefined;
-    if (!this._pdf)
+    if (!this._pdf && frame.url() !== this._mainFrameUrl) {
+      this._previousMainFrameUrl = this._mainFrameUrl;
       this._mainFrameUrl = frame.url();
+    }
   }
 
-  async ensurePdfInNewTab(): Promise<void> {
+  async ensurePdfInNewTab(restoreDirection: 'back' | 'forward' = 'back'): Promise<void> {
     const pdf = this._currentPdf();
     if (!pdf?.canRestore)
+      return;
+    // Blob and data documents only resolve in the tab that owns them and
+    // cannot be reproduced in another tab.
+    if (pdf.local)
       return;
     // Re-opening the document issues a fresh GET, so leave the results of
     // non-idempotent requests (e.g. POST form submissions) in place.
@@ -329,15 +344,31 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     await newTab._initializedPromise.catch(e => debug('pw:tools:error')(e));
     await newTab.page.goto(pdfUrl, { waitUntil: 'domcontentloaded', ...this.navigationTimeoutOptions }).catch(e => debug('pw:tools:error')(e));
     // Only give up this tab's copy once the new tab shows the same document.
-    if (newTab._currentPdf()?.url === pdf.url)
-      await this.page.goBack(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
-    if (urlWithoutFragment(this.page.url()) === urlWithoutFragment(pdf.url)) {
+    if (newTab._currentPdf()?.url === pdf.url) {
+      // A PDF reached via the Back button displaced the page that history
+      // navigation left, which sits in the forward direction.
+      if (restoreDirection === 'forward')
+        await this.page.goForward(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
+      else
+        await this.page.goBack(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
+    }
+    if (!await this._restoredAwayFromPdf(pdf)) {
       // The application page could not be restored (e.g. the PDF replaced its
       // history entry), so keep the PDF here and drop the extra tab.
       await newTab.page.close().catch(e => debug('pw:tools:error')(e));
       return;
     }
+    this._pdf = undefined;
     await newTab.page.waitForLoadState('load', { timeout: 5000 }).catch(e => debug('pw:tools:error')(e));
+  }
+
+  private async _restoredAwayFromPdf(pdf: PdfDocument): Promise<boolean> {
+    if (urlWithoutFragment(this.page.url()) !== urlWithoutFragment(pdf.url))
+      return true;
+    // The restored application page can share the PDF's url (e.g. an endpoint
+    // that served HTML before and a PDF now), so ask the document itself.
+    const contentType = await this.page.evaluate(() => document.contentType).catch(() => undefined);
+    return contentType !== undefined && contentType !== 'application/pdf';
   }
 
   private _handleRequestFailed(request: playwright.Request) {
@@ -498,7 +529,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     await this._initializedPromise;
     let tabSnapshot: TabSnapshot | undefined;
     const modalStates = await this._raceAgainstModalStates(async () => {
-      await this._detectLocalPdfDocument();
+      await this._probePdfDocument();
       const pdf = this._currentPdf();
       if (pdf) {
         tabSnapshot = {
@@ -531,16 +562,21 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     };
   }
 
-  // Blob and data urls never produce network responses, so probe the document itself.
-  private async _detectLocalPdfDocument() {
+  // Blob and data urls never produce a network response, and pages that were
+  // already open when attaching produced theirs before we listened - probe the
+  // document itself, once per url.
+  private async _probePdfDocument() {
     if (this._pdf)
       return;
     const url = this.page.url();
-    if (!url.startsWith('blob:') && !url.startsWith('data:'))
+    if (url === 'about:blank' || this._pdfProbedUrl === url)
       return;
+    this._pdfProbedUrl = url;
     const contentType = await this.page.evaluate(() => document.contentType).catch(() => undefined);
-    if (contentType === 'application/pdf' && this.page.url() === url)
-      this._pdf = { url, method: 'GET', canRestore: false, local: true };
+    if (contentType === 'application/pdf' && this.page.url() === url) {
+      const local = url.startsWith('blob:') || url.startsWith('data:');
+      this._pdf = { url, method: 'GET', canRestore: this._canRestoreFrom(this._previousMainFrameUrl, url), local };
+    }
   }
 
   private async _capturePdf(pdf: PdfDocument): Promise<PdfSnapshot> {
@@ -548,6 +584,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     // Saving re-issues the request, which cannot reproduce non-GET results.
     if (!pdf.local && pdf.method !== 'GET')
       return { url: pdf.url, error: `The document was produced by a ${pdf.method} request and cannot be re-fetched for saving.`, dedicatedTab };
+    // The output budget cleanup of a later response may have removed the file.
+    if (pdf.file && !await fs.promises.access(pdf.file).then(() => true, () => false))
+      pdf.file = undefined;
     if (!pdf.file) {
       try {
         // The navigation response body is the built-in PDF viewer in Chromium,

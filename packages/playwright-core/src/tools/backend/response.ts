@@ -271,6 +271,10 @@ export class Response {
 
     // Render tab titles upon changes or when more than one tab.
     const tabSnapshot = this._context.currentTab() ? await this._context.currentTabOrDie().captureSnapshot(this._includeSnapshotRoot, this._includeSnapshotDepth, this._includeSnapshotBoxes, this._clientWorkspace) : undefined;
+    // The PDF artifact is written by the tab rather than through _writeFile,
+    // register it so the output budget cleanup does not remove it.
+    if (tabSnapshot?.pdf?.file)
+      this._writtenFiles.add(path.resolve(tabSnapshot.pdf.file));
     const tabHeaders = await Promise.all(this._context.tabs().map(tab => tab.headerSnapshot()));
     if (this._includeSnapshot !== 'none' || tabHeaders.some(header => header.changed)) {
       if (tabHeaders.length !== 1)
@@ -287,13 +291,10 @@ export class Response {
     if (tabSnapshot && this._includeSnapshot !== 'none') {
       if (tabSnapshot.pdf) {
         const lines = [`- PDF document: ${tabSnapshot.pdf.url}`];
-        if (tabSnapshot.pdf.file) {
-          // Exempt from the output budget cleanup, like other files of this response.
-          this._writtenFiles.add(path.resolve(tabSnapshot.pdf.file));
+        if (tabSnapshot.pdf.file)
           lines.push(`- [PDF content](${this._computeRelativeTo(tabSnapshot.pdf.file)})`);
-        } else {
+        else
           lines.push(`- ${tabSnapshot.pdf.error ?? 'Failed to read the PDF content.'}`);
-        }
         if (tabSnapshot.pdf.dedicatedTab && this._context.tabs().length > 1)
           lines.push(`- The PDF is open in its own tab. Close the tab when done to return to the application.`);
         addSection('Snapshot', lines);

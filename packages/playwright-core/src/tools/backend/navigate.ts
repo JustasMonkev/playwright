@@ -51,7 +51,8 @@ const goBack = defineTabTool({
 
   handle: async (tab, params, response) => {
     await tab.page.goBack({ waitUntil: 'commit', ...tab.navigationTimeoutOptions });
-    await tab.ensurePdfInNewTab();
+    // The page this navigation came from sits in the forward direction.
+    await tab.ensurePdfInNewTab('forward');
     response.setIncludeSnapshot();
     response.addCode(`await page.goBack();`);
   },
@@ -89,6 +90,7 @@ const reload = defineTabTool({
 
   handle: async (tab, params, response) => {
     await tab.page.reload(tab.navigationTimeoutOptions);
+    await tab.ensurePdfInNewTab();
     response.setIncludeSnapshot();
     response.addCode(`await page.reload();`);
   },

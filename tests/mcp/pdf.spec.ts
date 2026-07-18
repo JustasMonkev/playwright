@@ -310,13 +310,106 @@ test('navigating back to a pdf in history moves it to a new tab', async ({ start
     arguments: { url: server.HELLO_WORLD },
   });
 
-  // History navigation into a PDF also moves it to a tab of its own.
+  // History navigation into a PDF also moves it to a tab of its own, and the
+  // page the back navigation came from is restored via forward.
   expect(await client.callTool({
     name: 'browser_navigate_back',
   })).toHaveResponse({
-    tabs: expect.stringContaining('1: (current)'),
+    tabs: expect.stringContaining('hello-world'),
     inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/empty.pdf`),
   });
+
+  await client.callTool({
+    name: 'browser_tabs',
+    arguments: { action: 'close' },
+  });
+  expect(await client.callTool({
+    name: 'browser_snapshot',
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('Hello, world!'),
+  });
+});
+
+test('pdf opened in the same tab via a blob url stays there', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/app', `
+    <title>App</title>
+    <button onclick="location.href = window.URL.createObjectURL(new Blob(['%PDF-1.4 inline blob'], { type: 'application/pdf' }))">View PDF</button>
+  `, 'text/html');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  const navigateResponse = await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/app' },
+  });
+  const ref = parseResponse(navigateResponse, testInfo.outputPath()).snapshot.match(/button "View PDF".*\[ref=(e\d+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+
+  // Blob urls cannot be reproduced in another tab, so the PDF stays here and
+  // the response must not advise closing the tab.
+  const clickResponse = await client.callTool({
+    name: 'browser_click',
+    arguments: { element: 'View PDF button', target: ref },
+  });
+  expect(clickResponse).toHaveResponse({
+    tabs: undefined,
+    inlineSnapshot: expect.stringContaining('- PDF document: blob:'),
+  });
+  expect(parseResponse(clickResponse, testInfo.outputPath()).inlineSnapshot).not.toContain('own tab');
+
+  // Going back restores the application in place.
+  expect(await client.callTool({
+    name: 'browser_navigate_back',
+  })).toHaveResponse({
+    snapshot: expect.stringContaining('View PDF'),
+  });
+});
+
+test('pdf survives the output budget cleanup', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output'), outputMaxSize: 1 },
+  });
+
+  await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/empty.pdf' },
+  });
+
+  // A tool without a snapshot in its response still captures the PDF; the
+  // budget cleanup must not delete it.
+  await client.callTool({
+    name: 'browser_tabs',
+    arguments: { action: 'list' },
+  });
+  expect(fs.existsSync(testInfo.outputPath('output', 'empty.pdf'))).toBeTruthy();
+
+  expect(await client.callTool({
+    name: 'browser_snapshot',
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('[PDF content](output/empty.pdf)'),
+  });
+  expect(fs.existsSync(testInfo.outputPath('output', 'empty.pdf'))).toBeTruthy();
+});
+
+test('pdf already open when attaching is detected', async ({ cdpServer, startClient, server }, testInfo) => {
+  const browserContext = await cdpServer.start();
+  const [page] = browserContext.pages();
+  await page.goto(server.PREFIX + '/empty.pdf');
+
+  const { client } = await startClient({
+    args: [`--cdp-endpoint=${cdpServer.endpoint}`],
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  expect(await client.callTool({
+    name: 'browser_snapshot',
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/empty.pdf`),
+  });
+  expect(fs.existsSync(testInfo.outputPath('output', 'empty.pdf'))).toBeTruthy();
 });
 
 test('pdf attachment triggers a download instead of a pdf tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
