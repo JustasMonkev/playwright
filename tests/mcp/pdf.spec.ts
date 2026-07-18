@@ -280,7 +280,7 @@ test('pdf link with a fragment opens in a new tab', async ({ startClient, mcpBro
 test('pdf content type is matched case-insensitively', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   server.setRoute('/upper.pdf', (req, res) => {
-    res.writeHead(200, { 'Content-Type': 'Application/PDF' });
+    res.writeHead(200, { 'Content-Type': 'Application/PDF; charset=binary' });
     res.end('%PDF-1.4 upper case');
   });
   const { client } = await startClient({
@@ -292,6 +292,128 @@ test('pdf content type is matched case-insensitively', async ({ startClient, mcp
     arguments: { url: server.PREFIX + '/upper.pdf' },
   })).toHaveResponse({
     inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/upper.pdf`),
+  });
+});
+
+test('pdf content type requires an exact media type', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/not-a-pdf', '<title>Plain document</title><body>Not a PDF</body>', 'application/pdfx');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  const response = await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/not-a-pdf' },
+  });
+  expect(parseResponse(response, testInfo.outputPath()).text).not.toContain('PDF document');
+});
+
+test('pdf artifacts with the same basename use separate files', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/accounts/report.pdf', '%PDF-1.4 accounts', 'application/pdf');
+  server.setContent('/orders/report.pdf', '%PDF-1.4 orders', 'application/pdf');
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({ config: { outputDir } });
+
+  await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/accounts/report.pdf' },
+  });
+  await client.callTool({
+    name: 'browser_tabs',
+    arguments: { action: 'new', url: server.PREFIX + '/orders/report.pdf' },
+  });
+
+  const pdfContents = fs.readdirSync(outputDir)
+      .filter(file => file.endsWith('.pdf'))
+      .map(file => fs.readFileSync(path.join(outputDir, file), 'utf8'));
+  expect(pdfContents).toEqual(expect.arrayContaining(['%PDF-1.4 accounts', '%PDF-1.4 orders']));
+  expect(pdfContents).toHaveLength(2);
+});
+
+test('failed pdf refetch is reported', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  let requests = 0;
+  server.setRoute('/once.pdf', (req, res) => {
+    if (++requests === 1) {
+      res.writeHead(200, { 'Content-Type': 'application/pdf' });
+      res.end('%PDF-1.4 once');
+    } else {
+      res.writeHead(410, { 'Content-Type': 'text/html' });
+      res.end('expired');
+    }
+  });
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({ config: { outputDir } });
+
+  const response = await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/once.pdf' },
+  });
+  expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('HTTP 410 Gone');
+  expect(fs.existsSync(outputDir) ? fs.readdirSync(outputDir).filter(file => file.endsWith('.pdf')) : []).toHaveLength(0);
+});
+
+test('pdf refetch follows the network origin policy across redirects', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  let requests = 0;
+  let blockedRequests = 0;
+  server.setRoute('/redirecting.pdf', (req, res) => {
+    if (++requests === 1) {
+      res.writeHead(200, { 'Content-Type': 'application/pdf' });
+      res.end('%PDF-1.4 redirect');
+    } else {
+      res.writeHead(302, { location: server.CROSS_PROCESS_PREFIX + '/blocked.pdf' });
+      res.end();
+    }
+  });
+  server.setRoute('/blocked.pdf', (req, res) => {
+    blockedRequests++;
+    res.writeHead(200, { 'Content-Type': 'application/pdf' });
+    res.end('%PDF-1.4 blocked');
+  });
+  const { client } = await startClient({
+    config: {
+      outputDir: testInfo.outputPath('output'),
+      network: { allowedOrigins: [server.PREFIX], blockedOrigins: [server.CROSS_PROCESS_PREFIX] },
+    },
+  });
+
+  const response = await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/redirecting.pdf' },
+  });
+  expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('blocked by the network origin policy');
+  expect(blockedRequests).toBe(0);
+});
+
+test('pdf reached with location.replace stays in the original tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/older', '<title>Older</title><body>Older page</body>', 'text/html');
+  server.setContent('/app', '<button onclick="location.replace(\'/report.pdf\')">Open report</button>', 'text/html');
+  server.setContent('/report.pdf', '%PDF-1.4 report', 'application/pdf');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/older' } });
+  const appResponse = await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/app' } });
+  const ref = parseResponse(appResponse, testInfo.outputPath()).snapshot.match(/button "Open report".*\[ref=([^\]]+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+
+  const pdfResponse = await client.callTool({
+    name: 'browser_click',
+    arguments: { element: 'Open report button', target: ref },
+  });
+  expect(pdfResponse).toHaveResponse({
+    tabs: undefined,
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/report.pdf`),
+  });
+  expect(parseResponse(pdfResponse, testInfo.outputPath()).inlineSnapshot).not.toContain('own tab');
+
+  expect(await client.callTool({ name: 'browser_navigate_back' })).toHaveResponse({
+    snapshot: expect.stringContaining('Older page'),
   });
 });
 

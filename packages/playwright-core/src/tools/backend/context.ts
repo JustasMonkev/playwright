@@ -21,6 +21,7 @@ import path from 'path';
 import debug from 'debug';
 import { escapeWithQuotes } from '@isomorphic/stringUtils';
 import { disposeAll } from '@isomorphic/disposable';
+import { urlMatches } from '@isomorphic/urlMatch';
 import { eventsHelper } from '@utils/eventsHelper';
 import { isPathInside, isSystemDirectory, isWritable } from '@utils/fileUtils';
 import { playwright } from '../../inprocess';
@@ -344,6 +345,13 @@ export class Context {
       return;
     if (new URL(url).protocol === 'file:')
       throw new Error(`Access to "file:" protocol is blocked. Attempted URL: "${url}"`);
+  }
+
+  checkNetworkUrlAllowed(url: string) {
+    const { allowedOrigins, blockedOrigins } = this.config.network ?? {};
+    const matches = (origin: string) => urlMatches(undefined, url, originOrHostGlob(origin));
+    if (blockedOrigins?.some(matches) || (allowedOrigins?.length && !allowedOrigins.some(matches)))
+      throw new Error(`Request to "${url}" is blocked by the network origin policy.`);
   }
 
   lookupSecret(secretName: string): { value: string, code: string } {
