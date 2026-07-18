@@ -30,7 +30,7 @@ import { handleDialog } from './dialogs';
 import { uploadFile } from './files';
 
 import type { Disposable } from '@isomorphic/disposable';
-import type { Context, ContextConfig, RouteEntry } from './context';
+import type { Context, ContextConfig } from './context';
 import type * as playwright from '../../..';
 
 const TabEvents = {
@@ -89,7 +89,6 @@ type PdfDocument = {
   // The application page displaced by this PDF navigation, when restorable.
   restoreUrl?: string;
   response?: playwright.Response;
-  route?: RouteEntry;
   // Set for documents that never hit the network (blob: and data: urls).
   local?: boolean;
   moveAttempted?: boolean;
@@ -294,7 +293,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     const disposition = response.headers()['content-disposition'] ?? '';
     if (isPdfContentType(contentType) && !disposition.toLowerCase().startsWith('attachment')) {
       const restoreUrl = this._restoreUrl(this._mainFrameUrl);
-      this._pdf = { url: response.url(), method: response.request().method(), restoreUrl, response, route: this.context.matchingRoute(response.url()) };
+      this._pdf = { url: response.url(), method: response.request().method(), restoreUrl, response };
     } else {
       this._pdf = undefined;
     }
@@ -319,6 +318,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   private _handleFrameNavigated(frame: playwright.Frame) {
     if (frame !== this.page.mainFrame())
       return;
+    this._pdfProbedUrl = undefined;
     // The PDF navigation response arrives before the frame navigation, so a
     // main frame navigation to any other url means the PDF is gone.
     if (this._pdf && urlWithoutFragment(frame.url()) !== urlWithoutFragment(this._pdf.url))
@@ -607,7 +607,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       try {
         // The navigation response body is the built-in PDF viewer in Chromium,
         // so re-fetch the document with the page credentials instead.
-        const data = pdf.local ? await this._fetchPdfInPage(pdf.url) : await this._fetchPdf(pdf);
+        const data = await this._fetchPdf(pdf);
         const suggestedFilename = suggestedPdfFilename(pdf.url);
         let file = await this.context.outputFile({ prefix: 'pdf', ext: 'pdf', suggestedFilename }, { origin: 'code' });
         try {
@@ -629,73 +629,87 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   }
 
   private async _fetchPdf(pdf: PdfDocument): Promise<Buffer> {
-    if (pdf.response?.fromServiceWorker())
-      throw new Error('Failed to read the PDF content: the document was served by a service worker and cannot be safely re-fetched.');
-    let url = pdf.url;
+    if (!pdf.local) {
+      this.context.checkNetworkUrlAllowed(pdf.url);
+      await this._checkPdfRedirectPolicy(pdf.url);
+    }
+    let blockedUrl: string | undefined;
+    const requestedUrls: string[] = [];
+    const requestListener = (request: playwright.Request) => requestedUrls.push(request.url());
+    const policyHandler = async (route: playwright.Route) => {
+      try {
+        this.context.checkNetworkUrlAllowed(route.request().url());
+        await route.fallback();
+      } catch {
+        blockedUrl = route.request().url();
+        await route.abort('blockedbyclient');
+      }
+    };
+    if (!pdf.local) {
+      this.page.on('request', requestListener);
+      await this.page.context().route('**', policyHandler);
+    }
+    try {
+      const requestHeaders = pdf.response ? await pdf.response.request().allHeaders() : {};
+      const result = await this.page.evaluate(async ({ url, referrer }) => {
+        const response = await fetch(url, {
+          credentials: 'include',
+          ...(referrer ? { referrer } : { referrerPolicy: 'no-referrer' }),
+        });
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        let binary = '';
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize)
+          binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+        return {
+          base64: btoa(binary),
+          contentType: response.headers.get('content-type') ?? '',
+          ok: response.ok,
+          status: response.status,
+          statusText: response.statusText,
+        };
+      }, { url: pdf.url, referrer: requestHeaders['referer'] });
+      if (blockedUrl)
+        this.context.checkNetworkUrlAllowed(blockedUrl);
+      for (const url of requestedUrls)
+        this.context.checkNetworkUrlAllowed(url);
+      if (!result.ok)
+        throw new Error(`Failed to read the PDF content: HTTP ${result.status} ${result.statusText}.`);
+      if (!isPdfContentType(result.contentType))
+        throw new Error(`Failed to read the PDF content: expected application/pdf, received ${result.contentType || 'no content type'}.`);
+      return Buffer.from(result.base64, 'base64');
+    } catch (error) {
+      if (blockedUrl)
+        this.context.checkNetworkUrlAllowed(blockedUrl);
+      for (const url of requestedUrls)
+        this.context.checkNetworkUrlAllowed(url);
+      throw error;
+    } finally {
+      if (!pdf.local) {
+        this.page.off('request', requestListener);
+        await this.page.context().unroute('**', policyHandler);
+      }
+    }
+  }
+
+  private async _checkPdfRedirectPolicy(startUrl: string): Promise<void> {
+    const { allowedOrigins, blockedOrigins } = this.context.config.network ?? {};
+    if (!allowedOrigins?.length && !blockedOrigins?.length)
+      return;
+    let url = startUrl;
     for (let redirects = 0; redirects <= 20; redirects++) {
       this.context.checkNetworkUrlAllowed(url);
-      const route = redirects === 0 ? pdf.route : this.context.matchingRoute(url);
-      if (route && (route.body !== undefined || route.status !== undefined)) {
-        if (pdf.response && !pdf.response.ok())
-          throw new Error(`Failed to read the PDF content: HTTP ${pdf.response.status()} ${pdf.response.statusText()}.`);
-        const data = Buffer.from(route.body ?? '');
-        this._checkPdfSize(data.length);
-        return data;
-      }
-      const headers = redirects === 0 && pdf.response ? await pdf.response.request().allHeaders() : {};
-      for (const [name, value] of Object.entries(route?.addHeaders ?? {}))
-        headers[name.toLowerCase()] = value;
-      for (const name of route?.removeHeaders ?? [])
-        headers[name.toLowerCase()] = '';
-      const response = await this.page.request.get(url, { maxRedirects: 0, headers });
+      const response = await this.page.request.get(url, { maxRedirects: 0 });
       try {
         const location = response.headers()['location'];
-        if (response.status() >= 300 && response.status() < 400 && location) {
-          url = new URL(location, url).href;
-          continue;
-        }
-        if (!response.ok())
-          throw new Error(`Failed to read the PDF content: HTTP ${response.status()} ${response.statusText()}.`);
-        if (!isPdfContentType(response.headers()['content-type'] ?? ''))
-          throw new Error(`Failed to read the PDF content: expected application/pdf, received ${response.headers()['content-type'] || 'no content type'}.`);
-        const contentLength = Number(response.headers()['content-length']);
-        this._checkPdfSize(Number.isSafeInteger(contentLength) && contentLength >= 0 ? contentLength : undefined);
-        const data = await response.body();
-        this._checkPdfSize(data.length);
-        return data;
+        if (response.status() < 300 || response.status() >= 400 || !location)
+          return;
+        url = new URL(location, url).href;
       } finally {
         await response.dispose();
       }
     }
     throw new Error('Failed to read the PDF content: too many redirects.');
-  }
-
-  private _checkPdfSize(size: number | undefined) {
-    const maxSize = this.context.config.outputMaxSize;
-    if (!maxSize)
-      return;
-    if (size === undefined)
-      throw new Error('Failed to read the PDF content: the response has no valid content-length within the configured outputMaxSize.');
-    if (size > maxSize)
-      throw new Error(`Failed to read the PDF content: ${size} bytes exceeds the configured outputMaxSize of ${maxSize} bytes.`);
-  }
-
-  private async _fetchPdfInPage(url: string): Promise<Buffer> {
-    const maxSize = this.context.config.outputMaxSize;
-    const base64 = await this.page.evaluate(async ({ url, maxSize }) => {
-      const response = await fetch(url);
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      if (maxSize && bytes.length > maxSize)
-        throw new Error(`Failed to read the PDF content: ${bytes.length} bytes exceeds the configured outputMaxSize of ${maxSize} bytes.`);
-      let binary = '';
-      const chunkSize = 0x8000;
-      for (let i = 0; i < bytes.length; i += chunkSize)
-        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-      return btoa(binary);
-    }, { url, maxSize });
-    const data = Buffer.from(base64, 'base64');
-    this._checkPdfSize(data.length);
-    return data;
   }
 
   private _javaScriptBlocked(): boolean {

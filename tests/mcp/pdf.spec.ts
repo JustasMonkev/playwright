@@ -218,7 +218,7 @@ test('pdf opened from a blob url is detected and read', async ({ startClient, mc
   });
 });
 
-test('local pdf capture respects outputMaxSize', async ({ startClient, mcpBrowser, server }, testInfo) => {
+test('local pdf larger than outputMaxSize is captured', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   const outputDir = testInfo.outputPath('output');
   const { client } = await startClient({ config: { outputDir, outputMaxSize: 10 } });
@@ -228,8 +228,10 @@ test('local pdf capture respects outputMaxSize', async ({ startClient, mcpBrowse
     arguments: { url: 'data:application/pdf;base64,' + Buffer.from('%PDF-1.4 oversized').toString('base64') },
   });
 
-  expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('exceeds the configured outputMaxSize');
-  expect(fs.existsSync(outputDir) ? fs.readdirSync(outputDir).filter(file => file.endsWith('.pdf')) : []).toHaveLength(0);
+  expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('[PDF content]');
+  const pdfFiles = fs.readdirSync(outputDir).filter(file => file.endsWith('.pdf'));
+  expect(pdfFiles).toHaveLength(1);
+  expect(fs.readFileSync(path.join(outputDir, pdfFiles[0]), 'utf8')).toBe('%PDF-1.4 oversized');
 });
 
 test('pdf produced by a form post stays in the same tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
@@ -448,6 +450,42 @@ test('delayed pdf navigation moves the pdf when the next response is built', asy
   });
 });
 
+test('revisited local pdf url is detected again', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const { client } = await startClient({ config: { outputDir: testInfo.outputPath('output') } });
+  const dataUrl = 'data:application/pdf;base64,' + Buffer.from('%PDF-1.4 revisited').toString('base64');
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.HELLO_WORLD } });
+  await client.callTool({ name: 'browser_navigate', arguments: { url: dataUrl } });
+  await client.callTool({ name: 'browser_navigate_back' });
+  await client.callTool({ name: 'browser_evaluate', arguments: { function: '() => history.forward()' } });
+  expect(await client.callTool({ name: 'browser_wait_for', arguments: { time: 1 } })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${dataUrl}`),
+  });
+});
+
+test('pdf capture preserves routes installed by initPage', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/init-routed.pdf', '%PDF-1.4 network', 'application/pdf');
+  const initPagePath = testInfo.outputPath('init-page.ts');
+  await fs.promises.writeFile(initPagePath, `
+    export default async ({ page }) => {
+      await page.route('**/init-routed.pdf', route => route.fulfill({
+        contentType: 'application/pdf',
+        body: '%PDF-1.4 init route',
+      }));
+    };
+  `);
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({
+    args: [`--init-page=${initPagePath}`],
+    config: { outputDir },
+  });
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/init-routed.pdf' } });
+  expect(fs.readFileSync(path.join(outputDir, 'init-routed.pdf'), 'utf8')).toBe('%PDF-1.4 init route');
+});
+
 test('failed pdf refetch is reported', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   let requests = 0;
@@ -567,7 +605,7 @@ test('same-url pdf restoration is attempted and verified', async ({ startClient,
   expect(reportRequests).toBe(4);
 });
 
-test('pdf capture respects outputMaxSize before buffering', async ({ startClient, mcpBrowser, server }, testInfo) => {
+test('pdf larger than outputMaxSize is captured', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   server.setRoute('/large.pdf', (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': '100' });
@@ -577,8 +615,8 @@ test('pdf capture respects outputMaxSize before buffering', async ({ startClient
   const { client } = await startClient({ config: { outputDir, outputMaxSize: 10 } });
 
   const response = await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/large.pdf' } });
-  expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('exceeds the configured outputMaxSize');
-  expect(fs.existsSync(outputDir) ? fs.readdirSync(outputDir).filter(file => file.endsWith('.pdf')) : []).toHaveLength(0);
+  expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('[PDF content]');
+  expect(fs.statSync(path.join(outputDir, 'large.pdf')).size).toBe(100);
 });
 
 test('navigating back to a pdf in history moves it to a new tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
