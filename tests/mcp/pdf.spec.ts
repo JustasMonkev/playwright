@@ -415,6 +415,37 @@ test('pdf refetch preserves navigation headers and route removals', async ({ sta
   expect(fs.readFileSync(path.join(outputDir, 'header-sensitive.pdf'), 'utf8')).toBe('%PDF-1.4 header sensitive');
 });
 
+test('pdf refetch preserves headers from a one-shot initPage route', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setRoute('/authorized.pdf', (req, res) => {
+    if (req.headers.authorization !== 'Bearer pdf-token') {
+      res.writeHead(401, { 'Content-Type': 'text/html' });
+      res.end('missing authorization');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/pdf' });
+    res.end('%PDF-1.4 authorized');
+  });
+  const initPagePath = testInfo.outputPath('authorize-pdf.ts');
+  await fs.promises.writeFile(initPagePath, `
+    export default async ({ page }) => {
+      const handler = async route => {
+        await route.continue({ headers: { ...await route.request().allHeaders(), authorization: 'Bearer pdf-token' } });
+        await page.unroute('**/authorized.pdf', handler);
+      };
+      await page.route('**/authorized.pdf', handler);
+    };
+  `);
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({
+    args: [`--init-page=${initPagePath}`],
+    config: { outputDir },
+  });
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/authorized.pdf' } });
+  expect(fs.readFileSync(path.join(outputDir, 'authorized.pdf'), 'utf8')).toBe('%PDF-1.4 authorized');
+});
+
 test('closing a moved pdf returns to its source tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   server.setContent('/source', '<title>Source</title><a href="/empty.pdf">Open PDF</a>', 'text/html');
@@ -432,6 +463,28 @@ test('closing a moved pdf returns to its source tab', async ({ startClient, mcpB
 
   expect(await client.callTool({ name: 'browser_snapshot' })).toHaveResponse({
     inlineSnapshot: expect.stringContaining('Open PDF'),
+  });
+});
+
+test('navigating away clears a moved pdf close target', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/source', '<title>Source</title><a href="/empty.pdf">Open PDF</a>', 'text/html');
+  server.setContent('/unrelated', '<title>Unrelated</title><body>Unrelated tab</body>', 'text/html');
+  server.setContent('/replacement', '<title>Replacement</title><body>Replacement page</body>', 'text/html');
+  const { client } = await startClient({ config: { outputDir: testInfo.outputPath('output') } });
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/source' } });
+  await client.callTool({ name: 'browser_tabs', arguments: { action: 'new', url: server.PREFIX + '/unrelated' } });
+  await client.callTool({ name: 'browser_tabs', arguments: { action: 'select', index: 0 } });
+  const sourceResponse = await client.callTool({ name: 'browser_snapshot' });
+  const ref = parseResponse(sourceResponse, testInfo.outputPath()).inlineSnapshot.match(/link "Open PDF".*\[ref=(e\d+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+  await client.callTool({ name: 'browser_click', arguments: { element: 'Open PDF link', target: ref } });
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/replacement' } });
+  await client.callTool({ name: 'browser_tabs', arguments: { action: 'close' } });
+
+  expect(await client.callTool({ name: 'browser_snapshot' })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('Unrelated tab'),
   });
 });
 
@@ -530,6 +583,7 @@ test('cross-origin referrer does not prevent pdf capture', async ({ startClient,
 test('pdf tab stays dedicated when initPage navigates new pages', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   server.setContent('/app', '<a href="/empty.pdf">Open PDF</a>', 'text/html');
+  server.setRedirect('/redirected.pdf', server.PREFIX + '/empty.pdf');
   const initPagePath = testInfo.outputPath('navigate-init-page.ts');
   await fs.promises.writeFile(initPagePath, `
     export default async ({ page }) => {
@@ -542,7 +596,7 @@ test('pdf tab stays dedicated when initPage navigates new pages', async ({ start
   });
 
   await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/app' } });
-  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/empty.pdf' } });
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/redirected.pdf' } });
   await client.callTool({ name: 'browser_snapshot' });
   const tabs = parseResponse(await client.callTool({ name: 'browser_tabs', arguments: { action: 'list' } }));
   expect(tabs.result).toContain('1: (current)');
@@ -732,6 +786,31 @@ test('navigating back to a pdf in history moves it to a new tab', async ({ start
   expect(await client.callTool({
     name: 'browser_snapshot',
   })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('Hello, world!'),
+  });
+});
+
+test('application history back to a pdf restores forward', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/empty.pdf' } });
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.HELLO_WORLD } });
+  expect(await client.callTool({
+    name: 'browser_evaluate',
+    arguments: { function: '() => history.back()' },
+  })).toHaveResponse({
+    tabs: expect.stringContaining('hello-world'),
+    inlineSnapshot: undefined,
+  });
+  expect(await client.callTool({ name: 'browser_snapshot' })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/empty.pdf`),
+  });
+
+  await client.callTool({ name: 'browser_tabs', arguments: { action: 'close' } });
+  expect(await client.callTool({ name: 'browser_snapshot' })).toHaveResponse({
     inlineSnapshot: expect.stringContaining('Hello, world!'),
   });
 });

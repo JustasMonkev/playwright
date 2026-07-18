@@ -19,6 +19,8 @@ import type { Tab } from './tab';
 
 export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>): Promise<R> {
   const requests: playwright.Request[] = [];
+  const initialUrl = tab.page.url();
+  const historyIndex = await navigationHistoryIndex(tab);
 
   const requestListener = (request: playwright.Request) => requests.push(request);
   const disposeListeners = () => {
@@ -34,10 +36,13 @@ export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>)
     disposeListeners();
   }
 
-  const requestedNavigation = requests.some(request => request.isNavigationRequest());
+  // Back/forward can restore from the back-forward cache without issuing a
+  // request, so a URL change is also evidence of navigation.
+  const requestedNavigation = requests.some(request => request.isNavigationRequest()) || tab.page.url() !== initialUrl;
   if (requestedNavigation) {
     await tab.page.mainFrame().waitForLoadState('load', { timeout: 10000 }).catch(() => {});
-    await tab.ensurePdfInNewTab();
+    const newHistoryIndex = await navigationHistoryIndex(tab);
+    await tab.ensurePdfInNewTab(historyIndex !== undefined && newHistoryIndex !== undefined && newHistoryIndex < historyIndex ? 'forward' : 'back');
     return result;
   }
 
@@ -54,6 +59,13 @@ export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>)
     await tab.waitForTimeout(500);
 
   return result;
+}
+
+async function navigationHistoryIndex(tab: Tab): Promise<number | undefined> {
+  return await tab.page.evaluate(() => {
+    const navigation = (globalThis as typeof globalThis & { navigation?: { currentEntry?: { index?: number } } }).navigation;
+    return navigation?.currentEntry?.index;
+  }).catch(() => undefined);
 }
 
 export function eventWaiter<T>(page: playwright.Page, event: string, timeout: number): { promise: Promise<T | undefined>, abort: () => void } {

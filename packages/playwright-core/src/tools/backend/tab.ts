@@ -289,16 +289,18 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   private _trackPdfDocument(response: playwright.Response) {
     if (!response.request().isNavigationRequest() || response.frame() !== this.page.mainFrame())
       return;
-    const dedicated = this._nextPdfIsDedicated;
-    this._nextPdfIsDedicated = false;
     const contentType = response.headers()['content-type'] ?? '';
     // Attachments trigger a download instead of committing a navigation.
     const disposition = response.headers()['content-disposition'] ?? '';
     if (isPdfContentType(contentType) && !disposition.toLowerCase().startsWith('attachment')) {
+      const dedicated = this._nextPdfIsDedicated;
+      this._nextPdfIsDedicated = false;
       const restoreUrl = dedicated ? undefined : this._restoreUrl(this._mainFrameUrl);
       this._pdf = { url: response.url(), method: response.request().method(), restoreUrl, response };
-    } else {
+    } else if (!response.request().redirectedTo()) {
+      this._nextPdfIsDedicated = false;
       this._pdf = undefined;
+      this.context.clearTabCloseTarget(this);
     }
   }
 
@@ -324,8 +326,10 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     this._pdfProbedUrl = undefined;
     // The PDF navigation response arrives before the frame navigation, so a
     // main frame navigation to any other url means the PDF is gone.
-    if (this._pdf && urlWithoutFragment(frame.url()) !== urlWithoutFragment(this._pdf.url))
+    if (this._pdf && urlWithoutFragment(frame.url()) !== urlWithoutFragment(this._pdf.url)) {
       this._pdf = undefined;
+      this.context.clearTabCloseTarget(this);
+    }
     if (!this._pdf && frame.url() !== this._mainFrameUrl) {
       this._previousMainFrameUrl = this._mainFrameUrl;
       this._mainFrameUrl = frame.url();
@@ -466,6 +470,10 @@ export class Tab extends EventEmitter<TabEventsInterface> {
 
   async navigate(url: string) {
     await this._initializedPromise;
+
+    // An explicit navigation repurposes a generated PDF tab, so closing the
+    // resulting page should follow normal tab adjacency.
+    this.context.clearTabCloseTarget(this);
 
     this._clearCollectedArtifacts();
 
@@ -640,6 +648,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     const sameOriginReferrer = originalReferrer && sameOrigin(originalReferrer, this.page.url()) ? originalReferrer : undefined;
     let blockedUrl: string | undefined;
     let pdfNetworkId: string | undefined;
+    let pdfRequestHeadersApplied = false;
     const internalRequests = new Set<playwright.Request>();
     const requestListener = (request: playwright.Request) => {
       if ((request.resourceType() === 'fetch' && urlWithoutFragment(request.url()) === urlWithoutFragment(pdf.url)) || (request.redirectedFrom() && internalRequests.has(request.redirectedFrom()!)))
@@ -661,10 +670,23 @@ export class Tab extends EventEmitter<TabEventsInterface> {
             return;
           }
         }
-        const headers = pdfNetworkId && event.networkId === pdfNetworkId && originalReferrer && !sameOriginReferrer ? [
-          ...Object.entries(event.request.headers).filter(([name]) => name.toLowerCase() !== 'referer').map(([name, value]) => ({ name, value: String(value) })),
-          { name: 'Referer', value: originalReferrer },
-        ] : undefined;
+        let headers: { name: string, value: string }[] | undefined;
+        if (pdfNetworkId && event.networkId === pdfNetworkId && !pdfRequestHeadersApplied) {
+          pdfRequestHeadersApplied = true;
+          const mergedHeaders = new Map(Object.entries(event.request.headers).map(([name, value]) => [name.toLowerCase(), { name, value: String(value) }]));
+          // Match the navigation's cookie state instead of silently adding
+          // cookies that a one-shot route removed from the original request.
+          mergedHeaders.delete('cookie');
+          for (const [name, value] of Object.entries(requestHeaders)) {
+            const lowerName = name.toLowerCase();
+            if (!isReusablePdfRequestHeader(lowerName))
+              continue;
+            mergedHeaders.set(lowerName, { name, value });
+          }
+          if (originalReferrer && !sameOriginReferrer)
+            mergedHeaders.set('referer', { name: 'Referer', value: originalReferrer });
+          headers = [...mergedHeaders.values()];
+        }
         void cdpSession.send('Fetch.continueRequest', { requestId: event.requestId, ...(headers ? { headers } : {}) }).catch(() => {});
       });
     }
@@ -872,6 +894,11 @@ function sameOrigin(a: string, b: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isReusablePdfRequestHeader(name: string): boolean {
+  // These are computed for the new request by the browser or transport.
+  return !['connection', 'content-length', 'host', 'transfer-encoding'].includes(name) && !name.startsWith('proxy-');
 }
 
 function isPdfContentType(contentType: string): boolean {

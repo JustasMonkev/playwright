@@ -184,6 +184,10 @@ export class Context {
     this._tabCloseTargets.set(tab, target);
   }
 
+  clearTabCloseTarget(tab: Tab) {
+    this._tabCloseTargets.delete(tab);
+  }
+
   async ensureTab(): Promise<Tab> {
     await this.ensureBrowserContext();
     const crashed = this._currentTab?.crashed;
