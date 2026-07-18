@@ -486,6 +486,58 @@ test('pdf capture preserves routes installed by initPage', async ({ startClient,
   expect(fs.readFileSync(path.join(outputDir, 'init-routed.pdf'), 'utf8')).toBe('%PDF-1.4 init route');
 });
 
+test('pdf capture uses a single saving request with network policy configured', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  let requests = 0;
+  server.setRoute('/limited.pdf', (req, res) => {
+    requests++;
+    res.writeHead(requests <= 2 ? 200 : 410, { 'Content-Type': 'application/pdf' });
+    res.end(requests <= 2 ? '%PDF-1.4 limited' : 'expired');
+  });
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({
+    config: { outputDir, network: { allowedOrigins: [server.PREFIX] } },
+  });
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/limited.pdf' } });
+  expect(fs.readFileSync(path.join(outputDir, 'limited.pdf'), 'utf8')).toBe('%PDF-1.4 limited');
+  expect(requests).toBe(2);
+});
+
+test('cross-origin referrer does not prevent pdf capture', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/app', `<button onclick="location.replace('${server.CROSS_PROCESS_PREFIX}/cross.pdf')">Open PDF</button>`, 'text/html');
+  server.setContent('/cross.pdf', '%PDF-1.4 cross origin', 'application/pdf');
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({ config: { outputDir } });
+
+  const navigateResponse = await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/app' } });
+  const ref = parseResponse(navigateResponse, testInfo.outputPath()).snapshot.match(/button "Open PDF".*\[ref=(e\d+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+  await client.callTool({ name: 'browser_click', arguments: { element: 'Open PDF button', target: ref } });
+
+  expect(fs.readFileSync(path.join(outputDir, 'cross.pdf'), 'utf8')).toBe('%PDF-1.4 cross origin');
+});
+
+test('pdf artifact fetch is omitted from network requests', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const { client } = await startClient({ config: { outputDir: testInfo.outputPath('output') } });
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/empty.pdf' } });
+  const requests = parseResponse(await client.callTool({ name: 'browser_network_requests' }));
+  expect(requests.result).not.toContain(server.PREFIX + '/empty.pdf');
+});
+
+test('pdf filename avoids Windows device names', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/CON.pdf', '%PDF-1.4 reserved name', 'application/pdf');
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({ config: { outputDir } });
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/CON.pdf' } });
+  expect(fs.readFileSync(path.join(outputDir, '_CON.pdf'), 'utf8')).toBe('%PDF-1.4 reserved name');
+});
+
 test('failed pdf refetch is reported', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   let requests = 0;

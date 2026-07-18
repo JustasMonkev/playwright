@@ -629,28 +629,38 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   }
 
   private async _fetchPdf(pdf: PdfDocument): Promise<Buffer> {
-    if (!pdf.local) {
+    if (!pdf.local)
       this.context.checkNetworkUrlAllowed(pdf.url);
-      await this._checkPdfRedirectPolicy(pdf.url);
-    }
     let blockedUrl: string | undefined;
-    const requestedUrls: string[] = [];
-    const requestListener = (request: playwright.Request) => requestedUrls.push(request.url());
-    const policyHandler = async (route: playwright.Route) => {
-      try {
-        this.context.checkNetworkUrlAllowed(route.request().url());
-        await route.fallback();
-      } catch {
-        blockedUrl = route.request().url();
-        await route.abort('blockedbyclient');
-      }
+    let pdfNetworkId: string | undefined;
+    const internalRequests = new Set<playwright.Request>();
+    const requestListener = (request: playwright.Request) => {
+      if ((request.resourceType() === 'fetch' && urlWithoutFragment(request.url()) === urlWithoutFragment(pdf.url)) || (request.redirectedFrom() && internalRequests.has(request.redirectedFrom()!)))
+        internalRequests.add(request);
     };
-    if (!pdf.local) {
-      this.page.on('request', requestListener);
-      await this.page.context().route('**', policyHandler);
+    this.page.on('request', requestListener);
+    const cdpSession = !pdf.local ? await this.page.context().newCDPSession(this.page) : undefined;
+    if (cdpSession) {
+      await cdpSession.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      cdpSession.on('Fetch.requestPaused', event => {
+        if (!pdfNetworkId && event.resourceType === 'XHR' && urlWithoutFragment(event.request.url) === urlWithoutFragment(pdf.url))
+          pdfNetworkId = event.networkId;
+        if (pdfNetworkId && event.networkId === pdfNetworkId) {
+          try {
+            this.context.checkNetworkUrlAllowed(event.request.url);
+          } catch {
+            blockedUrl = event.request.url;
+            void cdpSession.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' }).catch(() => {});
+            return;
+          }
+        }
+        void cdpSession.send('Fetch.continueRequest', { requestId: event.requestId }).catch(() => {});
+      });
     }
     try {
       const requestHeaders = pdf.response ? await pdf.response.request().allHeaders() : {};
+      const originalReferrer = requestHeaders['referer'];
+      const referrer = originalReferrer && sameOrigin(originalReferrer, this.page.url()) ? originalReferrer : undefined;
       const result = await this.page.evaluate(async ({ url, referrer }) => {
         const response = await fetch(url, {
           credentials: 'include',
@@ -668,11 +678,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           status: response.status,
           statusText: response.statusText,
         };
-      }, { url: pdf.url, referrer: requestHeaders['referer'] });
+      }, { url: pdf.url, referrer });
       if (blockedUrl)
         this.context.checkNetworkUrlAllowed(blockedUrl);
-      for (const url of requestedUrls)
-        this.context.checkNetworkUrlAllowed(url);
       if (!result.ok)
         throw new Error(`Failed to read the PDF content: HTTP ${result.status} ${result.statusText}.`);
       if (!isPdfContentType(result.contentType))
@@ -681,35 +689,12 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     } catch (error) {
       if (blockedUrl)
         this.context.checkNetworkUrlAllowed(blockedUrl);
-      for (const url of requestedUrls)
-        this.context.checkNetworkUrlAllowed(url);
       throw error;
     } finally {
-      if (!pdf.local) {
-        this.page.off('request', requestListener);
-        await this.page.context().unroute('**', policyHandler);
-      }
+      this.page.off('request', requestListener);
+      this._requests = this._requests.filter(request => !internalRequests.has(request));
+      await cdpSession?.detach().catch(() => {});
     }
-  }
-
-  private async _checkPdfRedirectPolicy(startUrl: string): Promise<void> {
-    const { allowedOrigins, blockedOrigins } = this.context.config.network ?? {};
-    if (!allowedOrigins?.length && !blockedOrigins?.length)
-      return;
-    let url = startUrl;
-    for (let redirects = 0; redirects <= 20; redirects++) {
-      this.context.checkNetworkUrlAllowed(url);
-      const response = await this.page.request.get(url, { maxRedirects: 0 });
-      try {
-        const location = response.headers()['location'];
-        if (response.status() < 300 || response.status() >= 400 || !location)
-          return;
-        url = new URL(location, url).href;
-      } finally {
-        await response.dispose();
-      }
-    }
-    throw new Error('Failed to read the PDF content: too many redirects.');
   }
 
   private _javaScriptBlocked(): boolean {
@@ -863,14 +848,22 @@ const tabSymbol = Symbol('tabSymbol');
 function sanitizeForFilePath(s: string) {
   const sanitize = (s: string) => s.replace(/[\x00-\x2C\x2E-\x2F\x3A-\x40\x5B-\x60\x7B-\x7F]+/g, '-');
   const separator = s.lastIndexOf('.');
-  if (separator === -1)
-    return sanitize(s);
-  return sanitize(s.substring(0, separator)) + '.' + sanitize(s.substring(separator + 1));
+  const result = separator === -1 ? sanitize(s) : sanitize(s.substring(0, separator)) + '.' + sanitize(s.substring(separator + 1));
+  const stem = result.split('.', 1)[0];
+  return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem) ? `_${result}` : result;
 }
 
 function urlWithoutFragment(url: string): string {
   const hashIndex = url.indexOf('#');
   return hashIndex === -1 ? url : url.substring(0, hashIndex);
+}
+
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
 }
 
 function isPdfContentType(contentType: string): boolean {
