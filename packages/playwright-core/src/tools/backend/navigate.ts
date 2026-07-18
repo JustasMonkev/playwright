@@ -51,6 +51,7 @@ const goBack = defineTabTool({
 
   handle: async (tab, params, response) => {
     await tab.page.goBack({ waitUntil: 'commit', ...tab.navigationTimeoutOptions });
+    await tab.ensurePdfInNewTab();
     response.setIncludeSnapshot();
     response.addCode(`await page.goBack();`);
   },
@@ -69,6 +70,7 @@ const goForward = defineTabTool({
 
   handle: async (tab, params, response) => {
     await tab.page.goForward({ waitUntil: 'commit', ...tab.navigationTimeoutOptions });
+    await tab.ensurePdfInNewTab();
     response.setIncludeSnapshot();
     response.addCode(`await page.goForward();`);
   },

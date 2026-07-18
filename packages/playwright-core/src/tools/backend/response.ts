@@ -292,9 +292,9 @@ export class Response {
           this._writtenFiles.add(path.resolve(tabSnapshot.pdf.file));
           lines.push(`- [PDF content](${this._computeRelativeTo(tabSnapshot.pdf.file)})`);
         } else {
-          lines.push(`- Failed to read the PDF content.`);
+          lines.push(`- ${tabSnapshot.pdf.error ?? 'Failed to read the PDF content.'}`);
         }
-        if (this._context.tabs().length > 1)
+        if (tabSnapshot.pdf.dedicatedTab && this._context.tabs().length > 1)
           lines.push(`- The PDF is open in its own tab. Close the tab when done to return to the application.`);
         addSection('Snapshot', lines);
       } else if (this._includeSnapshot !== 'explicit' || this._includeSnapshotFileName) {

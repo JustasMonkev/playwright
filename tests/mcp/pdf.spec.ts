@@ -242,12 +242,80 @@ test('pdf produced by a form post stays in the same tab', async ({ startClient, 
   expect(ref).toBeTruthy();
 
   // The POST result cannot be reproduced by a fresh GET, so the PDF is kept in place.
-  expect(await client.callTool({
+  const clickResponse = await client.callTool({
     name: 'browser_click',
     arguments: { element: 'Generate report button', target: ref },
-  })).toHaveResponse({
+  });
+  expect(clickResponse).toHaveResponse({
     tabs: undefined,
     inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/report.pdf`),
+  });
+  const parsed = parseResponse(clickResponse, testInfo.outputPath());
+  expect(parsed.inlineSnapshot).toContain('cannot be re-fetched');
+  expect(parsed.inlineSnapshot).not.toContain('own tab');
+});
+
+test('pdf link with a fragment opens in a new tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.HELLO_WORLD },
+  });
+
+  expect(await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/empty.pdf#page=1' },
+  })).toHaveResponse({
+    tabs: expect.stringContaining('1: (current)'),
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/empty.pdf`),
+  });
+
+  expect(fs.existsSync(testInfo.outputPath('output', 'empty.pdf'))).toBeTruthy();
+});
+
+test('pdf content type is matched case-insensitively', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setRoute('/upper.pdf', (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'Application/PDF' });
+    res.end('%PDF-1.4 upper case');
+  });
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  expect(await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/upper.pdf' },
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/upper.pdf`),
+  });
+});
+
+test('navigating back to a pdf in history moves it to a new tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/empty.pdf' },
+  });
+  await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.HELLO_WORLD },
+  });
+
+  // History navigation into a PDF also moves it to a tab of its own.
+  expect(await client.callTool({
+    name: 'browser_navigate_back',
+  })).toHaveResponse({
+    tabs: expect.stringContaining('1: (current)'),
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/empty.pdf`),
   });
 });
 
