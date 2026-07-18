@@ -125,6 +125,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   private _mainFrameUrl: string;
   private _previousMainFrameUrl: string = 'about:blank';
   private _pdfProbedUrl: string | undefined;
+  private _nextPdfIsDedicated = false;
   private _initializedPromise: Promise<void>;
   private _recentEventEntries: EventEntry[] = [];
   private _consoleLog: LogFile;
@@ -288,11 +289,13 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   private _trackPdfDocument(response: playwright.Response) {
     if (!response.request().isNavigationRequest() || response.frame() !== this.page.mainFrame())
       return;
+    const dedicated = this._nextPdfIsDedicated;
+    this._nextPdfIsDedicated = false;
     const contentType = response.headers()['content-type'] ?? '';
     // Attachments trigger a download instead of committing a navigation.
     const disposition = response.headers()['content-disposition'] ?? '';
     if (isPdfContentType(contentType) && !disposition.toLowerCase().startsWith('attachment')) {
-      const restoreUrl = this._restoreUrl(this._mainFrameUrl);
+      const restoreUrl = dedicated ? undefined : this._restoreUrl(this._mainFrameUrl);
       this._pdf = { url: response.url(), method: response.request().method(), restoreUrl, response };
     } else {
       this._pdf = undefined;
@@ -350,6 +353,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     const newTab = await this.context.newTab();
     this.context.setTabCloseTarget(newTab, this);
     await newTab._initializedPromise.catch(e => debug('pw:tools:error')(e));
+    newTab._nextPdfIsDedicated = true;
     await newTab.page.goto(pdfUrl, { waitUntil: 'domcontentloaded', ...this.navigationTimeoutOptions }).catch(e => debug('pw:tools:error')(e));
     // Only give up this tab's copy once the new tab shows the same document.
     if (newTab._currentPdf()?.url === pdf.url) {
@@ -631,6 +635,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   private async _fetchPdf(pdf: PdfDocument): Promise<Buffer> {
     if (!pdf.local)
       this.context.checkNetworkUrlAllowed(pdf.url);
+    const requestHeaders = pdf.response ? await pdf.response.request().allHeaders() : {};
+    const originalReferrer = requestHeaders['referer'];
+    const sameOriginReferrer = originalReferrer && sameOrigin(originalReferrer, this.page.url()) ? originalReferrer : undefined;
     let blockedUrl: string | undefined;
     let pdfNetworkId: string | undefined;
     const internalRequests = new Set<playwright.Request>();
@@ -643,7 +650,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     if (cdpSession) {
       await cdpSession.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
       cdpSession.on('Fetch.requestPaused', event => {
-        if (!pdfNetworkId && event.resourceType === 'XHR' && urlWithoutFragment(event.request.url) === urlWithoutFragment(pdf.url))
+        if (!pdfNetworkId && (event.resourceType === 'XHR' || event.resourceType === 'Fetch') && urlWithoutFragment(event.request.url) === urlWithoutFragment(pdf.url))
           pdfNetworkId = event.networkId;
         if (pdfNetworkId && event.networkId === pdfNetworkId) {
           try {
@@ -654,13 +661,14 @@ export class Tab extends EventEmitter<TabEventsInterface> {
             return;
           }
         }
-        void cdpSession.send('Fetch.continueRequest', { requestId: event.requestId }).catch(() => {});
+        const headers = pdfNetworkId && event.networkId === pdfNetworkId && originalReferrer && !sameOriginReferrer ? [
+          ...Object.entries(event.request.headers).filter(([name]) => name.toLowerCase() !== 'referer').map(([name, value]) => ({ name, value: String(value) })),
+          { name: 'Referer', value: originalReferrer },
+        ] : undefined;
+        void cdpSession.send('Fetch.continueRequest', { requestId: event.requestId, ...(headers ? { headers } : {}) }).catch(() => {});
       });
     }
     try {
-      const requestHeaders = pdf.response ? await pdf.response.request().allHeaders() : {};
-      const originalReferrer = requestHeaders['referer'];
-      const referrer = originalReferrer && sameOrigin(originalReferrer, this.page.url()) ? originalReferrer : undefined;
       const result = await this.page.evaluate(async ({ url, referrer }) => {
         const response = await fetch(url, {
           credentials: 'include',
@@ -678,7 +686,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           status: response.status,
           statusText: response.statusText,
         };
-      }, { url: pdf.url, referrer });
+      }, { url: pdf.url, referrer: sameOriginReferrer });
       if (blockedUrl)
         this.context.checkNetworkUrlAllowed(blockedUrl);
       if (!result.ok)

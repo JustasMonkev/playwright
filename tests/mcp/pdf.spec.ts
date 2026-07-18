@@ -507,7 +507,15 @@ test('pdf capture uses a single saving request with network policy configured', 
 test('cross-origin referrer does not prevent pdf capture', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   server.setContent('/app', `<button onclick="location.replace('${server.CROSS_PROCESS_PREFIX}/cross.pdf')">Open PDF</button>`, 'text/html');
-  server.setContent('/cross.pdf', '%PDF-1.4 cross origin', 'application/pdf');
+  server.setRoute('/cross.pdf', (req, res) => {
+    if (req.headers.referer !== server.PREFIX + '/') {
+      res.writeHead(403, { 'Content-Type': 'text/html' });
+      res.end('missing cross-origin referer');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/pdf' });
+    res.end('%PDF-1.4 cross origin');
+  });
   const outputDir = testInfo.outputPath('output');
   const { client } = await startClient({ config: { outputDir } });
 
@@ -517,6 +525,28 @@ test('cross-origin referrer does not prevent pdf capture', async ({ startClient,
   await client.callTool({ name: 'browser_click', arguments: { element: 'Open PDF button', target: ref } });
 
   expect(fs.readFileSync(path.join(outputDir, 'cross.pdf'), 'utf8')).toBe('%PDF-1.4 cross origin');
+});
+
+test('pdf tab stays dedicated when initPage navigates new pages', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/app', '<a href="/empty.pdf">Open PDF</a>', 'text/html');
+  const initPagePath = testInfo.outputPath('navigate-init-page.ts');
+  await fs.promises.writeFile(initPagePath, `
+    export default async ({ page }) => {
+      await page.goto('${server.HELLO_WORLD}');
+    };
+  `);
+  const { client } = await startClient({
+    args: [`--init-page=${initPagePath}`],
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/app' } });
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/empty.pdf' } });
+  await client.callTool({ name: 'browser_snapshot' });
+  const tabs = parseResponse(await client.callTool({ name: 'browser_tabs', arguments: { action: 'list' } }));
+  expect(tabs.result).toContain('1: (current)');
+  expect(tabs.result).not.toContain('2:');
 });
 
 test('pdf artifact fetch is omitted from network requests', async ({ startClient, mcpBrowser, server }, testInfo) => {
