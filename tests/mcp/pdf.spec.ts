@@ -15,8 +15,9 @@
  */
 
 import fs from 'fs';
+import path from 'path';
 
-import { test, expect } from './fixtures';
+import { test, expect, parseResponse } from './fixtures';
 
 test('save as pdf unavailable', async ({ startClient, server }) => {
   const { client } = await startClient();
@@ -84,4 +85,98 @@ test('save as pdf (filename: output.pdf)', async ({ startClient, mcpBrowser, ser
   const pdfFiles = files.filter(f => f.endsWith('.pdf'));
   expect(pdfFiles).toHaveLength(1);
   expect(pdfFiles[0]).toMatch(/^output.pdf$/);
+});
+
+test('navigating to a pdf opens it in a new tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.HELLO_WORLD },
+  });
+
+  expect(await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/empty.pdf' },
+  })).toHaveResponse({
+    tabs: expect.stringContaining('1: (current)'),
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/empty.pdf`),
+  });
+
+  // The PDF content is saved for reading.
+  const pdfPath = testInfo.outputPath('output', 'empty.pdf');
+  expect(fs.existsSync(pdfPath)).toBeTruthy();
+  expect(fs.readFileSync(pdfPath).equals(fs.readFileSync(path.join(__dirname, '../assets/empty.pdf')))).toBeTruthy();
+
+  // Closing the PDF tab returns to the application.
+  expect(await client.callTool({
+    name: 'browser_tabs',
+    arguments: { action: 'close', index: 1 },
+  })).toHaveResponse({
+    result: expect.stringContaining('0: (current)'),
+  });
+
+  expect(await client.callTool({
+    name: 'browser_snapshot',
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('Hello, world!'),
+  });
+});
+
+test('clicking a link to a pdf opens it in a new tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/app', `
+    <title>App</title>
+    <a href="${server.PREFIX}/empty.pdf">Open PDF</a>
+  `, 'text/html');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  const navigateResponse = await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/app' },
+  });
+  const ref = parseResponse(navigateResponse, testInfo.outputPath()).snapshot.match(/link "Open PDF".*\[ref=(e\d+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+
+  expect(await client.callTool({
+    name: 'browser_click',
+    arguments: { element: 'Open PDF link', target: ref },
+  })).toHaveResponse({
+    tabs: expect.stringContaining('1: (current)'),
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/empty.pdf`),
+  });
+
+  // Closing the current (PDF) tab returns to the application.
+  await client.callTool({
+    name: 'browser_tabs',
+    arguments: { action: 'close' },
+  });
+
+  expect(await client.callTool({
+    name: 'browser_snapshot',
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('Open PDF'),
+  });
+});
+
+test('navigating to a pdf in a fresh tab keeps a single tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  expect(await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/empty.pdf' },
+  })).toHaveResponse({
+    tabs: undefined,
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/empty.pdf`),
+  });
+
+  expect(fs.existsSync(testInfo.outputPath('output', 'empty.pdf'))).toBeTruthy();
 });

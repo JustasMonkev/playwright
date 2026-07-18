@@ -37,6 +37,7 @@ export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>)
   const requestedNavigation = requests.some(request => request.isNavigationRequest());
   if (requestedNavigation) {
     await tab.page.mainFrame().waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+    await tab.ensurePdfInNewTab();
     return result;
   }
 

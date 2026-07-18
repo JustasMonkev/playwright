@@ -260,7 +260,16 @@ export class Response {
 
     // Handle tab snapshot
     if (tabSnapshot && this._includeSnapshot !== 'none') {
-      if (this._includeSnapshot !== 'explicit' || this._includeSnapshotFileName) {
+      if (tabSnapshot.pdf) {
+        const lines = [`- PDF document: ${tabSnapshot.pdf.url}`];
+        if (tabSnapshot.pdf.file)
+          lines.push(`- [PDF content](${this._computeRelativeTo(tabSnapshot.pdf.file)})`);
+        else
+          lines.push(`- Failed to read the PDF content.`);
+        if (this._context.tabs().length > 1)
+          lines.push(`- The PDF is open in its own tab. Close the tab when done to return to the application.`);
+        addSection('Snapshot', lines);
+      } else if (this._includeSnapshot !== 'explicit' || this._includeSnapshotFileName) {
         const suggestedFilename = this._includeSnapshotFileName === '<auto>' ? undefined : this._includeSnapshotFileName;
         const resolvedFile = await this.resolveClientFile({ prefix: 'page', ext: 'yml', suggestedFilename }, 'Snapshot');
         await this._writeFile(resolvedFile, tabSnapshot.ariaSnapshot);

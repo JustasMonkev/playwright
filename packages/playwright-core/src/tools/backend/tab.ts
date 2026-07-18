@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import fs from 'fs';
 import { EventEmitter } from 'events';
 import debug from 'debug';
 import { asLocator } from '@isomorphic/locatorGenerators';
@@ -80,11 +81,19 @@ export type TabHeader = {
   console: { total: number, warnings: number, errors: number };
 };
 
+type PdfDocument = {
+  url: string;
+  // Set when the tab showed an application page before the PDF navigation replaced it.
+  canRestore: boolean;
+  file?: string;
+};
+
 type TabSnapshot = {
   ariaSnapshot: string;
   modalStates: ModalState[];
   events: EventEntry[];
   consoleLink?: string;
+  pdf?: { url: string, file?: string };
 };
 
 export class Tab extends EventEmitter<TabEventsInterface> {
@@ -96,6 +105,8 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   private _onPageClose: (tab: Tab) => void;
   crashed = false;
   private _modalStates: ModalState[] = [];
+  private _pdf: PdfDocument | undefined;
+  private _mainFrameUrl: string = 'about:blank';
   private _initializedPromise: Promise<void>;
   private _recentEventEntries: EventEntry[] = [];
   private _consoleLog: LogFile;
@@ -116,6 +127,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       eventsHelper.addEventListener(p, 'request', request => this._handleRequest(request)),
       eventsHelper.addEventListener(p, 'response', response => this._handleResponse(response)),
       eventsHelper.addEventListener(p, 'requestfailed', request => this._handleRequestFailed(request)),
+      eventsHelper.addEventListener(p, 'framenavigated', frame => this._handleFrameNavigated(frame)),
       eventsHelper.addEventListener(p, 'close', () => this._onClose()),
       eventsHelper.addEventListener(p, 'crash', () => { this.crashed = true; }),
       eventsHelper.addEventListener(p, 'filechooser', chooser => {
@@ -241,6 +253,40 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     const timing = response.request().timing();
     const wallTime = timing.responseStart + timing.startTime;
     this._addLogEntry({ type: 'request', wallTime, request: response.request() });
+    this._trackPdfDocument(response);
+  }
+
+  private _trackPdfDocument(response: playwright.Response) {
+    if (!response.request().isNavigationRequest() || response.frame() !== this.page.mainFrame())
+      return;
+    const contentType = response.headers()['content-type'] ?? '';
+    if (contentType.includes('application/pdf'))
+      this._pdf = { url: response.url(), canRestore: this._mainFrameUrl !== 'about:blank' };
+    else
+      this._pdf = undefined;
+  }
+
+  private _handleFrameNavigated(frame: playwright.Frame) {
+    if (frame !== this.page.mainFrame())
+      return;
+    // The PDF navigation response arrives before the frame navigation, so a
+    // main frame navigation to any other url means the PDF is gone.
+    if (this._pdf && frame.url() !== this._pdf.url)
+      this._pdf = undefined;
+    if (!this._pdf)
+      this._mainFrameUrl = frame.url();
+  }
+
+  async ensurePdfInNewTab(): Promise<void> {
+    const pdf = this._pdf;
+    if (!pdf?.canRestore)
+      return;
+    // Keep the application page in this tab and move the PDF into a tab of its
+    // own, so that closing the PDF leaves the application unaffected.
+    const newTab = await this.context.newTab();
+    await this.page.goBack(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
+    await newTab.page.goto(pdf.url, { waitUntil: 'domcontentloaded', ...this.navigationTimeoutOptions }).catch(e => debug('pw:tools:error')(e));
+    await newTab.waitForLoadState('load', { timeout: 5000 });
   }
 
   private _handleRequestFailed(request: playwright.Request) {
@@ -344,6 +390,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
 
     // Cap load event to 5 seconds, the page is operational at this point.
     await this.waitForLoadState('load', { timeout: 5000 });
+    await this.ensurePdfInNewTab();
   }
 
   async consoleMessageCount(): Promise<{ total: number, errors: number, warnings: number }> {
@@ -400,6 +447,15 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     await this._initializedPromise;
     let tabSnapshot: TabSnapshot | undefined;
     const modalStates = await this._raceAgainstModalStates(async () => {
+      if (this._pdf) {
+        tabSnapshot = {
+          ariaSnapshot: '',
+          modalStates: [],
+          events: [],
+          pdf: await this._capturePdf(this._pdf),
+        };
+        return;
+      }
       const ariaSnapshot = root
         ? await root.ariaSnapshot({ mode: 'ai', depth, boxes })
         : await this.page.ariaSnapshot({ mode: 'ai', depth, boxes });
@@ -420,6 +476,23 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       modalStates,
       events: [],
     };
+  }
+
+  private async _capturePdf(pdf: PdfDocument): Promise<{ url: string, file?: string }> {
+    if (!pdf.file) {
+      try {
+        // The navigation response body is the built-in PDF viewer in Chromium,
+        // so re-fetch the document with the page credentials instead.
+        const response = await this.page.request.get(pdf.url);
+        const data = await response.body();
+        const file = await this.context.outputFile({ prefix: 'pdf', ext: 'pdf', suggestedFilename: suggestedPdfFilename(pdf.url) }, { origin: 'code' });
+        await fs.promises.writeFile(file, data);
+        pdf.file = file;
+      } catch (e) {
+        debug('pw:tools:error')(e);
+      }
+    }
+    return { url: pdf.url, file: pdf.file };
   }
 
   private _javaScriptBlocked(): boolean {
@@ -576,6 +649,17 @@ function sanitizeForFilePath(s: string) {
   if (separator === -1)
     return sanitize(s);
   return sanitize(s.substring(0, separator)) + '.' + sanitize(s.substring(separator + 1));
+}
+
+function suggestedPdfFilename(url: string): string | undefined {
+  try {
+    const pathname = new URL(url).pathname;
+    const baseName = decodeURIComponent(pathname.substring(pathname.lastIndexOf('/') + 1));
+    if (baseName.toLowerCase().endsWith('.pdf'))
+      return sanitizeForFilePath(baseName);
+  } catch {
+  }
+  return undefined;
 }
 
 function tabHeaderEquals(a: TabHeader, b: TabHeader): boolean {
