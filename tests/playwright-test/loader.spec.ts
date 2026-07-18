@@ -15,6 +15,7 @@
  */
 
 import { test, expect, playwrightCtConfigText } from './playwright-test-fixtures';
+import fs from 'fs';
 import path from 'path';
 import url from 'url';
 
@@ -913,6 +914,44 @@ test('should resolve no-extension import of module into .ts file', async ({ runI
   expect(result.exitCode).toBe(0);
 });
 
+test('should resolve extensionless .ts subpath import across a workspace symlink in ESM', {
+  annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/41371' },
+}, async ({ runInlineTest }, testInfo) => {
+  const baseDir = testInfo.outputPath();
+  const symlinkType = process.platform === 'win32' ? 'junction' : 'dir';
+  const link = async (target: string, linkPath: string) => {
+    await fs.promises.mkdir(path.dirname(linkPath), { recursive: true });
+    await fs.promises.symlink(path.join(baseDir, target), linkPath, symlinkType);
+  };
+  // It is important to symlink so that our belongsToNodeModules() check does not trigger.
+  await link('packages/shared', path.join(baseDir, 'packages/core/node_modules/@repro/shared'));
+  await link('packages/core', path.join(baseDir, 'apps/e2e/node_modules/@repro/core'));
+
+  const result = await runInlineTest({
+    // Root package.json is required for workspace:* dependencies to work.
+    'package.json': JSON.stringify({ name: 'repro-root', private: true }),
+    'packages/shared/package.json': JSON.stringify({ name: '@repro/shared', private: true, type: 'module' }),
+    'packages/shared/lib/text.utils.ts': `
+      export function greet(name: string) {
+        return 'Hello, ' + name;
+      }
+    `,
+    'packages/core/package.json': JSON.stringify({ name: '@repro/core', private: true, type: 'module', dependencies: { '@repro/shared': 'workspace:*' } }),
+    'packages/core/lib/conversations.ts': `
+      export { greet } from '@repro/shared/lib/text.utils';
+    `,
+    'apps/e2e/tests/basic.spec.ts': `
+      import { test, expect } from '@playwright/test';
+      import { greet } from '@repro/core/lib/conversations';
+      test('greet returns expected string', () => {
+        expect(greet('world')).toBe('Hello, world');
+      });
+    `,
+  });
+  expect(result.passed).toBe(1);
+  expect(result.exitCode).toBe(0);
+});
+
 test('should support node imports', async ({ runInlineTest }) => {
   const result = await runInlineTest({
     'playwright.config.ts': 'export default {}',
@@ -1196,7 +1235,7 @@ test('should compose with a custom ESM loader before playwright', {
         expect(1 + 1).toBe(2);
       });
     `,
-  });
+  }, {}, { PLAYWRIGHT_FORCE_ASYNC_LOADER: '1' });
 
   expect(result.exitCode).toBe(0);
   expect(result.passed).toBe(1);
@@ -1259,6 +1298,7 @@ test('should compose with a custom ESM loader after playwright', {
     `,
   }, {}, {
     NODE_OPTIONS: `--import ${url.pathToFileURL(testInfo.outputPath('register-loader.mjs')).toString()}`,
+    PLAYWRIGHT_FORCE_ASYNC_LOADER: '1',
   });
 
   expect(result.exitCode).toBe(0);
@@ -1309,7 +1349,7 @@ test('preflight should survive faulty ESM loader ahead of playwright', {
         expect(1 + 1).toBe(2);
       });
     `,
-  }, {}, { DEBUG: 'pw:test' });
+  }, {}, { DEBUG: 'pw:test', PLAYWRIGHT_FORCE_ASYNC_LOADER: '1' });
 
   expect(result.exitCode).toBe(0);
   expect(result.passed).toBe(1);

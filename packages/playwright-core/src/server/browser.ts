@@ -27,11 +27,12 @@ import { PlaywrightPipeServer } from '../remote/playwrightPipeServer';
 import { PlaywrightWebSocketServer } from '../remote/playwrightWebSocketServer';
 import { BrowserInfo, serverRegistry } from '../serverRegistry';
 import { nullProgress } from './progress';
+import { TargetClosedError } from './errors';
 
 import type * as types from './types';
 import type { ProxySettings } from './types';
 import type { RecentLogsCollector } from '@utils/debugLogger';
-import type * as channels from '@protocol/channels';
+import type * as channels from './channels';
 import type { ChildProcess } from 'child_process';
 import type { Language } from '@isomorphic/locatorGenerators';
 import type { Progress } from './progress';
@@ -79,7 +80,7 @@ export abstract class Browser extends SdkObject {
   private _startedClosing = false;
   private _contextForReuse: { context: BrowserContext, hash: string } | undefined;
   _closeReason: string | undefined;
-  _isCollocatedWithServer: boolean = true;
+  _isBrowserCollocatedWithServer: boolean = true;
   private _server: BrowserServer;
 
   constructor(parent: SdkObject, options: BrowserOptions) {
@@ -174,6 +175,8 @@ export abstract class Browser extends SdkObject {
       context.browserClosed();
     if (this._defaultContext)
       this._defaultContext.browserClosed();
+    for (const download of this._downloads.values())
+      download.artifact.reportFinished(new TargetClosedError(undefined));
     this.stopServer(nullProgress).catch(() => {});
     this.emit(Browser.Events.Disconnected);
     this.instrumentation.onBrowserClose(this);
@@ -196,6 +199,8 @@ export abstract class Browser extends SdkObject {
 
   async killForTests(progress: Progress) {
     await progress.race(this.options.browserProcess.kill());
+    if (this.isConnected())
+      await progress.race(new Promise(x => this.once(Browser.Events.Disconnected, x)));
   }
 }
 

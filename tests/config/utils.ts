@@ -19,8 +19,7 @@ import { utils, iso } from '../../packages/playwright-core/lib/coreBundle';
 
 import type { iso as isoType } from '../../packages/playwright-core/lib/coreBundle';
 import type { Locator, Frame, Page } from 'playwright-core';
-import type { StackFrame } from '../../packages/protocol/src/channels';
-import type { ActionTraceEvent, TraceEvent } from '@trace/trace';
+import type { StackFrame, ActionTraceEvent, TraceEvent } from '@trace/trace';
 
 const { TraceLoader, TraceModel } = iso;
 type TraceModel = InstanceType<typeof TraceModel>;
@@ -231,7 +230,7 @@ export function unshift(snapshot: string): string {
   return lines.filter(t => t.trim()).map(line => line.substring(whitespacePrefixLength)).join('\n');
 }
 
-const ansiRegex = new RegExp('[\\u001B\\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]*)*)?\\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-ntqry=><~]))', 'g');
+const ansiRegex = new RegExp('[\\u001B\\u009B][[\\]()#?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]*)*)?\\u0007)|(?:(?:\\d{0,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-ntqry=><~]))', 'g');
 export function stripAnsi(str: string): string {
   return str.replace(ansiRegex, '');
 }

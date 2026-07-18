@@ -48,6 +48,7 @@ it('should scope context handles', async ({ browserType, server, expectScopeStat
       { _guid: 'browser-type', objects: [
         { _guid: 'browser', objects: [] }
       ] },
+      { _guid: 'electron', objects: [] },
       { _guid: 'localUtils', objects: [] },
       { _guid: 'Playwright', objects: [] },
     ]
@@ -80,6 +81,7 @@ it('should scope context handles', async ({ browserType, server, expectScopeStat
           ] },
         ] },
       ] },
+      { _guid: 'electron', objects: [] },
       { _guid: 'localUtils', objects: [] },
       { _guid: 'Playwright', objects: [] },
     ]
@@ -103,6 +105,7 @@ it('should scope CDPSession handles', async ({ browserType, browserName, expectS
       { _guid: 'browser-type', objects: [
         { _guid: 'browser', objects: [] }
       ] },
+      { _guid: 'electron', objects: [] },
       { _guid: 'localUtils', objects: [] },
       { _guid: 'Playwright', objects: [] },
     ]
@@ -121,6 +124,7 @@ it('should scope CDPSession handles', async ({ browserType, browserName, expectS
           { _guid: 'cdp-session', objects: [] },
         ] },
       ] },
+      { _guid: 'electron', objects: [] },
       { _guid: 'localUtils', objects: [] },
       { _guid: 'Playwright', objects: [] },
     ]
@@ -140,6 +144,7 @@ it('should scope browser handles', async ({ browserType, expectScopeState }) => 
       { _guid: 'browser-type', objects: [] },
       { _guid: 'browser-type', objects: [] },
       { _guid: 'browser-type', objects: [] },
+      { _guid: 'electron', objects: [] },
       { _guid: 'localUtils', objects: [] },
       { _guid: 'Playwright', objects: [] },
     ]
@@ -166,6 +171,7 @@ it('should scope browser handles', async ({ browserType, expectScopeState }) => 
         },
       ]
       },
+      { _guid: 'electron', objects: [] },
       { _guid: 'localUtils', objects: [] },
       { _guid: 'Playwright', objects: [] },
     ]
@@ -208,13 +214,14 @@ it('should not generate dispatchers for subresources w/o listeners', async ({ pa
           ]
         }],
       },
+      { _guid: 'electron', objects: [] },
       { _guid: 'localUtils', objects: [] },
       { _guid: 'Playwright', objects: [] },
     ]
   });
 });
 
-it('should work with the domain module', async ({ browserType, server, browserName, channel }) => {
+it('should work with the domain module', async ({ browserType, server, channel }) => {
   const local = domain.create();
   local.run(() => { });
   let err;
@@ -234,10 +241,7 @@ it('should work with the domain module', async ({ browserType, server, browserNa
     new WebSocket('ws://' + host + '/bogus-ws');
   }, server.HOST);
   const message = await result;
-  if (browserName === 'firefox')
-    expect(message).toBe('CLOSE_ABNORMAL');
-  else
-    expect(message).toContain(channel?.includes('msedge') ? '' : ': 400');
+  expect(message).toContain(channel?.includes('msedge') ? '' : ': 400');
 
   await browser.close();
 
@@ -315,6 +319,10 @@ it('exposeFunction should not leak', async ({ page, expectScopeState, server }) 
             ],
           },
         ],
+      },
+      {
+        '_guid': 'electron',
+        'objects': [],
       },
       {
         '_guid': 'localUtils',

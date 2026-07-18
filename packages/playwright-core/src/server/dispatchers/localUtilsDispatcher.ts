@@ -16,12 +16,12 @@
 
 import net from 'net';
 import { resolveGlobToRegexPattern } from '@isomorphic/urlMatch';
+import { deviceDescriptors as descriptors }  from '@isomorphic/deviceDescriptors';
 import { fetchData } from '../utils';
 import { getUserAgent } from '../userAgent';
 import { Dispatcher } from './dispatcher';
 import { SdkObject } from '../instrumentation';
 import * as localUtils from '../localUtils';
-import { deviceDescriptors as descriptors }  from '../deviceDescriptors';
 import { JsonPipeDispatcher } from '../dispatchers/jsonPipeDispatcher';
 import { PipeTransport } from '../pipeTransport';
 import { Progress } from '../progress';
@@ -31,7 +31,7 @@ import { WebSocketTransport } from '../transport';
 import type { HarBackend } from '../harBackend';
 import type { Playwright } from '../playwright';
 import type { RootDispatcher } from './dispatcher';
-import type * as channels from '@protocol/channels';
+import type * as channels from '../channels';
 import type * as http from 'http';
 import type { HTTPRequestParams } from '@utils/network';
 
@@ -65,6 +65,10 @@ export class LocalUtilsDispatcher extends Dispatcher<SdkObject, channels.LocalUt
 
   async harClose(params: channels.LocalUtilsHarCloseParams, progress: Progress): Promise<void> {
     localUtils.harClose(this._harBackends, params);
+  }
+
+  harBackendForId(harId: string): HarBackend | undefined {
+    return this._harBackends.get(harId);
   }
 
   async harUnzip(params: channels.LocalUtilsHarUnzipParams, progress: Progress): Promise<void> {

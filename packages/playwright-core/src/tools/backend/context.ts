@@ -45,9 +45,8 @@ export type ContextConfig = {
     blockedOrigins?: string[];
   };
   outputDir?: string;
-  outputMode?: 'file' | 'stdout';
+  outputMaxSize?: number;
   saveSession?: boolean;
-  saveTrace?: boolean;
   secrets?: Record<string, string>;
   snapshot?: {
     mode?: 'full' | 'none';
@@ -190,6 +189,7 @@ export class Context {
       await this.newTab();
     if (crashed)
       this._currentTab!.logErrorMessage('Page crashed and was reset to about:blank.');
+    await this._currentTab!.waitForInitialized();
     return this._currentTab!;
   }
 
@@ -236,8 +236,9 @@ export class Context {
     const suffix = this._video.fileNames.length ? `-${this._video.fileNames.length}` : '';
     let fileName = this._video.fileName;
     if (fileName && suffix) {
+      const dir = path.dirname(fileName);
       const ext = path.extname(fileName);
-      fileName = path.basename(fileName, ext) + suffix + ext;
+      fileName = path.join(dir, path.basename(fileName, ext) + suffix + ext);
     }
     this._video.fileNames.push(fileName);
     await page.screencast.start({ path: fileName, ...this._video.params });
@@ -326,19 +327,6 @@ export class Context {
     const browserContext = this._rawBrowserContext;
     await this._setupRequestInterception(browserContext);
 
-    if (this.config.saveTrace) {
-      await browserContext.tracing.start({
-        name: 'trace-' + Date.now(),
-        screenshots: true,
-        snapshots: true,
-        live: true,
-      });
-      this._disposables.push({
-        dispose: async () => {
-          await browserContext.tracing.stop();
-        },
-      });
-    }
     for (const initScript of this.config.browser?.initScript || [])
       this._disposables.push(await browserContext.addInitScript({ path: path.resolve(this.options.cwd, initScript) }));
 
@@ -365,6 +353,15 @@ export class Context {
       value: this.config.secrets[secretName]!,
       code: `process.env['${secretName}']`,
     };
+  }
+
+  redactSecrets(text: string): string {
+    for (const [secretName, secretValue] of Object.entries(this.config.secrets ?? {})) {
+      if (!secretValue)
+        continue;
+      text = text.replaceAll(secretValue, `<secret>${secretName}</secret>`);
+    }
+    return text;
   }
 }
 

@@ -163,9 +163,13 @@ function innerAsLocators(factory: LocatorFactory, parsed: ParsedSelector, isFram
       const options: LocatorOptions = { attrs: [] };
       for (const attr of attrSelector.attributes) {
         if (attr.name === 'name') {
+          if (options.exact !== undefined && options.exact !== attr.caseSensitive)
+            throw new Error(`Conflicting exactness in internal:role selector: ${stringifySelector({ parts: [part] })}`);
           options.exact = attr.caseSensitive;
           options.name = attr.value;
         } else if (attr.name === 'description') {
+          if (options.exact !== undefined && options.exact !== attr.caseSensitive)
+            throw new Error(`Conflicting exactness in internal:role selector: ${stringifySelector({ parts: [part] })}`);
           options.exact = attr.caseSensitive;
           options.description = attr.value;
         } else {
@@ -730,8 +734,13 @@ export class JsonlLocatorFactory implements LocatorFactory {
 
   chainLocators(locators: string[]): string {
     const objects = locators.map(l => JSON.parse(l));
-    for (let i = 0; i < objects.length - 1; ++i)
-      objects[i].next = objects[i + 1];
+    for (let i = 0; i < objects.length - 1; ++i) {
+      // A locator may already be a chain, e.g. `contentFrame()` produces one. Append to its tail.
+      let tail = objects[i];
+      while (tail.next)
+        tail = tail.next;
+      tail.next = objects[i + 1];
+    }
     return JSON.stringify(objects[0]);
   }
 }

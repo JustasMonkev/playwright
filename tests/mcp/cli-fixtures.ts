@@ -48,19 +48,13 @@ export const test = baseTest.extend<{
   },
   startDashboardServer: async ({ childProcess, page }, use) => {
     await use(async (options?: { cwd?: string, session?: string }) => {
-      const testInfo = test.info();
-      const showArgs = options?.session ? [`-s=${options.session}`, 'show'] : ['show'];
-      const serverProcess = childProcess({
-        command: [process.execPath, require.resolve('../../packages/playwright-core/lib/tools/cli-client/cli.js'), ...showArgs, '--port=0'],
-        cwd: options?.cwd ?? testInfo.outputPath(),
-        env: inheritAndCleanEnv(cliEnv()),
-      });
+      const serverProcess = spawnDashboardServer(childProcess, options);
       await serverProcess.waitForOutput('Listening on ');
       await page.goto(serverProcess.output.match(/Listening on (http:\/\/\S+)/)![1]);
       return page;
     });
   },
-  connectToDashboard: [async ({ cli, playwright }, use) => {
+  connectToDashboard: async ({ cli, playwright }, use) => {
     await use(async (bindTitle: string) => {
       let endpoint = '';
       await expect(async () => {
@@ -72,7 +66,7 @@ export const test = baseTest.extend<{
       return await playwright.chromium.connect(endpoint);
     });
     await cli('show', '--kill');
-  }, { timeout: 60000 }],
+  },
 
   cli: async ({ mcpBrowser, mcpHeadless, childProcess }, use) => {
     await fs.promises.mkdir(test.info().outputPath('.playwright'), { recursive: true });
@@ -81,7 +75,10 @@ export const test = baseTest.extend<{
     await use(async (...args: string[]) => {
       const cliArgs = args.filter(arg => typeof arg === 'string');
       const cliOptions = args.findLast(arg => typeof arg === 'object') || {};
-      const result = await runCli(childProcess, cliArgs, cliOptions, { mcpBrowser, mcpHeadless });
+      const result = await test.step(
+          `cli ${cliArgs.join(' ')}`,
+          () => runCli(childProcess, cliArgs, cliOptions, { mcpBrowser, mcpHeadless })
+      );
       if (result.daemonPid)
         allPids.push(result.daemonPid);
       if (result.dashboardPid)
@@ -114,12 +111,21 @@ export const test = baseTest.extend<{
   },
 });
 
+export function spawnDashboardServer(childProcess: CommonFixtures['childProcess'], options?: { cwd?: string, session?: string }) {
+  const showArgs = options?.session ? [`-s=${options.session}`, 'show'] : ['show'];
+  return childProcess({
+    command: [process.execPath, require.resolve('../../packages/playwright-core/lib/tools/cli-client/cli.js'), ...showArgs, '--port=0'],
+    cwd: options?.cwd ?? test.info().outputPath(),
+    env: inheritAndCleanEnv(cliEnv()),
+  });
+}
+
 function cliEnv() {
   return {
-    PLAYWRIGHT_SERVER_REGISTRY: test.info().outputPath('registry'),
+    PWTEST_SERVER_REGISTRY: test.info().outputPath('registry'),
     PWTEST_DASHBOARD_SETTINGS_FILE: test.info().outputPath('dashboard.settings.json'),
-    PLAYWRIGHT_DAEMON_SESSION_DIR: test.info().outputPath('daemon'),
-    PLAYWRIGHT_SOCKETS_DIR: path.join(os.tmpdir(), 'ds-' + crypto.createHash('sha1').update(test.info().outputDir).digest('hex').slice(0, 16)),
+    PWTEST_DAEMON_SESSION_DIR: test.info().outputPath('daemon'),
+    PWTEST_SOCKETS_DIR: path.join(os.tmpdir(), 'ds-' + crypto.createHash('sha1').update(test.info().outputDir).digest('hex').slice(0, 16)),
     PWTEST_CLI_CHANNEL_SCAN_DISABLED_FOR_TEST: '1',
   };
 }

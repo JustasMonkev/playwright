@@ -19,6 +19,7 @@ import path from 'path';
 
 import { deserializeURLMatch, urlMatches } from '@isomorphic/urlMatch';
 import { createGuid } from '@utils/crypto';
+import { throwingResolveWithinRoot } from '@utils/fileUtils';
 import { BrowserContext } from '../browserContext';
 import { CDPSessionDispatcher } from './cdpSessionDispatcher';
 import { DebuggerDispatcher } from './debuggerDispatcher';
@@ -45,12 +46,14 @@ import type { Request, Response, RouteHandler } from '../network';
 import type { InitScript, Page, PageError } from '../page';
 import type { Disposable } from '../disposable';
 import type { DispatcherScope } from './dispatcher';
-import type * as channels from '@protocol/channels';
-import type { Progress } from '@protocol/progress';
+import type { LocalUtilsDispatcher } from './localUtilsDispatcher';
+import type * as channels from '../channels';
+import type { Progress } from '../progress';
 import type { URLMatch } from '@isomorphic/urlMatch';
 
+type HarForAPIRequestsDisposable = Disposable & { registrationId: string };
+
 export class BrowserContextDispatcher extends Dispatcher<BrowserContext, channels.BrowserContextChannel, DispatcherScope> implements channels.BrowserContextChannel {
-  _type_EventTarget = true;
   _type_BrowserContext = true;
   private _context: BrowserContext;
   private _subscriptions = new Set<channels.BrowserContextUpdateSubscriptionParams['event']>();
@@ -232,8 +235,9 @@ export class BrowserContextDispatcher extends Dispatcher<BrowserContext, channel
     return {
       rootDir: params.rootDirName ? new WritableStreamDispatcher(this, tempDirWithRootName) : undefined,
       writableStreams: await Promise.all(params.items.map(async item => {
-        await progress.race(fs.promises.mkdir(path.dirname(path.join(tempDirWithRootName, item.name)), { recursive: true }));
-        const file = fs.createWriteStream(path.join(tempDirWithRootName, item.name));
+        const itemPath = throwingResolveWithinRoot(tempDirWithRootName, item.name);
+        await progress.race(fs.promises.mkdir(path.dirname(itemPath), { recursive: true }));
+        const file = fs.createWriteStream(itemPath);
         return new WritableStreamDispatcher(this, file, item.lastModifiedMs);
       }))
     };
@@ -334,8 +338,40 @@ export class BrowserContextDispatcher extends Dispatcher<BrowserContext, channel
       this._routeWebSocketInitScript = await WebSocketRouteDispatcher.install(progress, this.connection, this._context);
   }
 
+  async routeAPIRequestsFromHar(params: channels.BrowserContextRouteAPIRequestsFromHarParams, progress: Progress): Promise<channels.BrowserContextRouteAPIRequestsFromHarResult> {
+    // Reuse the HarBackend that was already opened via localUtils.harOpen for the page-side
+    // route, rather than opening a second backend for the same HAR file. The backend is owned
+    // by LocalUtils and closed via harClose, so this registration must not dispose it.
+    const harBackend = this.connection.getDispatcher<LocalUtilsDispatcher>('LocalUtils')?.harBackendForId(params.harId);
+    if (!harBackend)
+      throw new Error('Internal error: har was not opened');
+    const urlMatch: URLMatch | undefined =
+      params.urlRegexSource !== undefined && params.urlRegexFlags !== undefined ? new RegExp(params.urlRegexSource, params.urlRegexFlags) :
+        params.urlGlob !== undefined ? params.urlGlob : undefined;
+    const registrationId = createGuid();
+    const registration = this._context.routeAPIRequestsFromHar({
+      harBackend,
+      urlMatch,
+      notFound: params.notFound,
+      baseURL: this._context._options.baseURL,
+    });
+    this._disposables.push({
+      registrationId,
+      dispose: async () => registration.dispose(),
+    } as HarForAPIRequestsDisposable);
+    return { registrationId };
+  }
+
+  async unrouteAPIRequestsFromHar(params: channels.BrowserContextUnrouteAPIRequestsFromHarParams, progress: Progress): Promise<void> {
+    const index = this._disposables.findIndex(d => (d as HarForAPIRequestsDisposable).registrationId === params.registrationId);
+    if (index === -1)
+      return;
+    const [disposable] = this._disposables.splice(index, 1);
+    await progress.race(disposable.dispose());
+  }
+
   async storageState(params: channels.BrowserContextStorageStateParams, progress: Progress): Promise<channels.BrowserContextStorageStateResult> {
-    return await this._context.storageState(progress, params.indexedDB);
+    return await this._context.storageState(progress, params.indexedDB, params.credentials);
   }
 
   async setStorageState(params: channels.BrowserContextSetStorageStateParams, progress: Progress): Promise<void> {
@@ -343,7 +379,6 @@ export class BrowserContextDispatcher extends Dispatcher<BrowserContext, channel
   }
 
   async close(params: channels.BrowserContextCloseParams, progress: Progress): Promise<void> {
-    progress.metadata.potentiallyClosesScope = true;
     await this._context.close(progress, params);
   }
 
@@ -402,6 +437,24 @@ export class BrowserContextDispatcher extends Dispatcher<BrowserContext, channel
 
   async clockSetSystemTime(params: channels.BrowserContextClockSetSystemTimeParams, progress: Progress): Promise<channels.BrowserContextClockSetSystemTimeResult> {
     await progress.race(this._context.clock.setSystemTime(params.timeString ?? params.timeNumber ?? 0));
+  }
+
+  async credentialsInstall(params: channels.BrowserContextCredentialsInstallParams, progress: Progress): Promise<channels.BrowserContextCredentialsInstallResult> {
+    await this._context.credentials.install(progress);
+  }
+
+  async credentialsCreate(params: channels.BrowserContextCredentialsCreateParams, progress: Progress): Promise<channels.BrowserContextCredentialsCreateResult> {
+    const credential = await progress.race(this._context.credentials.create(params));
+    return { credential };
+  }
+
+  async credentialsGet(params: channels.BrowserContextCredentialsGetParams, progress: Progress): Promise<channels.BrowserContextCredentialsGetResult> {
+    const credentials = await progress.race(this._context.credentials.get(params));
+    return { credentials };
+  }
+
+  async credentialsDelete(params: channels.BrowserContextCredentialsDeleteParams, progress: Progress): Promise<channels.BrowserContextCredentialsDeleteResult> {
+    await progress.race(this._context.credentials.delete(params.id));
   }
 
   async updateSubscription(params: channels.BrowserContextUpdateSubscriptionParams, progress: Progress): Promise<void> {

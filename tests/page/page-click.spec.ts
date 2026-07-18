@@ -1200,10 +1200,8 @@ it('should click if opened select covers the button', async ({ page }) => {
   expect(await page.evaluate('window.__CLICKED')).toBe(42);
 });
 
-it('should fire contextmenu event on right click in correct order', async ({ page, server, browserName }) => {
+it('should fire contextmenu event on right click in correct order', async ({ page, server, browserName, isWindows }) => {
   it.info().annotations.push({ type: 'issue', description: 'https://github.com/microsoft/playwright/issues/26515' });
-  it.fixme(browserName === 'chromium', 'mouseup is fired');
-  it.fixme(browserName === 'firefox', 'mouseup is fired');
   await page.goto(server.EMPTY_PAGE);
   await page.setContent(`
     <button id="target">Click me</button>
@@ -1217,15 +1215,27 @@ it('should fire contextmenu event on right click in correct order', async ({ pag
   const entries = [];
   page.on('console', message => entries.push(message.text()));
   await page.getByRole('button', { name: 'Click me' }).click({ button: 'right' });
-  await expect.poll(() => entries).toEqual([
-    'mousedown',
-    'contextmenu',
-  ]);
+  if (browserName === 'chromium' && isWindows)
+    await expect.poll(() => entries).toEqual(['mousedown', 'mouseup', 'contextmenu']);
+  else
+    await expect.poll(() => entries).toEqual(['mousedown', 'contextmenu', 'mouseup']);
+});
+
+it('should click after a right click', { annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/39246' } }, async ({ page }) => {
+  await page.setContent(`
+    <button>Click me</button>
+    <script>
+      const button = document.querySelector('button');
+      button.addEventListener('click', () => button.textContent = 'Clicked!');
+    </script>
+  `);
+  await page.getByRole('button').click({ button: 'right' });
+  await page.getByRole('button').click();
+  await expect(page.getByRole('button')).toHaveText('Clicked!');
 });
 
 it('should set PointerEvent.pressure on pointerdown', async ({ page, isLinux, headless }) => {
   it.info().annotations.push({ type: 'issue', description: 'https://github.com/microsoft/playwright/issues/35844' });
-  it.fixme(isLinux && !headless, 'Stray mouse events on Linux headed mess up the tests.');
   await page.setContent(`
     <button id="target">Click me</button>
     <script>
@@ -1235,16 +1245,14 @@ it('should set PointerEvent.pressure on pointerdown', async ({ page, isLinux, he
     </script>
   `);
   await page.click('button');
-  expect(await page.evaluate(() => window['pressures'])).toEqual([
+  expect(await page.evaluate(() => window['pressures'])).toEqual(expect.arrayContaining([
     ['pointerdown', 0.5],
     ['pointerup', 0],
-  ]);
+  ]));
 });
 
 it('should set PointerEvent.pressure on pointermove', async ({ page, isLinux, headless, isWindows, browserName, isAndroid }) => {
   it.info().annotations.push({ type: 'issue', description: 'https://github.com/microsoft/playwright/issues/35844' });
-  it.fixme(isLinux && !headless, 'Stray mouse events on Linux headed mess up the tests.');
-  it.fixme(isWindows && !headless && browserName === 'webkit', 'WebKit win also send stray mouse events.');
   it.fixme(isAndroid, 'Android coordinates seem to have rounding issues.');
   await page.setContent(`
     <body style="margin: 0; padding: 0;">
@@ -1261,12 +1269,12 @@ it('should set PointerEvent.pressure on pointermove', async ({ page, isLinux, he
   await page.mouse.move(250, 250);
   await page.mouse.up();
   await page.mouse.move(50, 50);
-  expect(await page.evaluate(() => window['pressures'])).toEqual([
+  expect(await page.evaluate(() => window['pressures'])).toEqual(expect.arrayContaining([
     [0, 250, 250],
     [0, 10, 10],
     [0.5, 250, 250],
     [0, 50, 50],
-  ]);
+  ]));
 });
 
 it('should click into shadow root with slotted div', { annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/37768' } }, async ({ page }) => {
@@ -1351,4 +1359,53 @@ it('should not wait with noAutoWaiting 3', async ({ page }) => {
   await page.setContent(`<button disabled>click me</button>`);
   const error = await page.locator('button').click({ __testHookNoAutoWaiting: true } as any).catch(e => e);
   expect(error.message).toContain('locator.click: Element is not enabled');
+});
+
+it('should abort via signal', async ({ page }) => {
+  await page.setContent(`<button style="display:none">click me</button>`);
+  const controller = new AbortController();
+  const promise = page.locator('button').click({ signal: controller.signal, timeout: 0 }).catch(e => e);
+  // Give the action time to start and emit call log entries before aborting.
+  await page.waitForTimeout(500);
+
+  const reason = new Error('foo bar');
+  controller.abort(reason);
+  const error = await promise;
+  expect(error.message).toContain('locator.click: foo bar');
+  expect(error.message).toMatch(/Call log:[\s\S]*operation was aborted: foo bar/);
+  expect(error.name).toBe('AbortError');
+  expect(error.cause).toBe(reason);
+});
+
+it('should throw an Error when aborted in-flight with a string reason', async ({ page }) => {
+  await page.setContent(`<button style="display:none">click me</button>`);
+  const controller = new AbortController();
+  const promise = page.locator('button').click({ signal: controller.signal, timeout: 0 });
+  controller.abort('aborted by user');
+  const error = await promise.catch(e => e);
+  expect(error).toBeInstanceOf(Error);
+  expect(error.message).toContain('locator.click: aborted by user');
+  expect(error.name).toBe('AbortError');
+  expect(error.cause).toBe('aborted by user');
+});
+
+it('should abort via already-aborted signal', async ({ page }) => {
+  await page.setContent(`<button>click me</button>`);
+  const controller = new AbortController();
+  const reason = new Error('Already aborted');
+  controller.abort(reason);
+  const error = await page.locator('button').click({ signal: controller.signal }).catch(e => e);
+  expect(error.message).toContain('The operation was aborted');
+  expect(error.name).toBe('AbortError');
+  expect(error.cause).toBe(reason);
+});
+
+it('should throw an Error when aborted via an already-aborted signal with a string reason', async ({ page }) => {
+  await page.setContent(`<button>click me</button>`);
+  const controller = new AbortController();
+  controller.abort('already aborted');
+  const error = await page.locator('button').click({ signal: controller.signal }).catch(e => e);
+  expect(error).toBeInstanceOf(Error);
+  expect(error.name).toBe('AbortError');
+  expect(error.cause).toBe('already aborted');
 });

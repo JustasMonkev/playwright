@@ -48,7 +48,7 @@ export class FullConfigInternal {
   readonly projects: FullProjectInternal[] = [];
   readonly singleTSConfigPath?: string;
   readonly captureGitInfo: Config['captureGitInfo'];
-  readonly failOnFlakyTests: boolean;
+  readonly retryStrategy: 'immediate' | 'isolated';
   defineConfigWasUsed = false;
 
   globalSetups: string[] = [];
@@ -68,7 +68,7 @@ export class FullConfigInternal {
     this.plugins = (privateConfiguration?.plugins || []).map((p: any) => ({ factory: p }));
     this.singleTSConfigPath = pathResolve(configDir, userConfig.tsconfig);
     this.captureGitInfo = userConfig.captureGitInfo;
-    this.failOnFlakyTests = takeFirst(configCLIOverrides.failOnFlakyTests, userConfig.failOnFlakyTests, false);
+    this.retryStrategy = takeFirst(userConfig.retryStrategy, 'immediate');
 
     this.globalSetups = (Array.isArray(userConfig.globalSetup) ? userConfig.globalSetup : [userConfig.globalSetup]).map(s => resolveScript(s, configDir)).filter(script => script !== undefined);
     this.globalTeardowns = (Array.isArray(userConfig.globalTeardown) ? userConfig.globalTeardown : [userConfig.globalTeardown]).map(s => resolveScript(s, configDir)).filter(script => script !== undefined);
@@ -84,8 +84,10 @@ export class FullConfigInternal {
     }
 
     this.config = {
+      argv: configCLIOverrides.argv ?? [],
       configFile: resolvedConfigFile,
       rootDir: pathResolve(configDir, userConfig.testDir) || configDir,
+      failOnFlakyTests: takeFirst(configCLIOverrides.failOnFlakyTests, userConfig.failOnFlakyTests, false),
       forbidOnly: takeFirst(configCLIOverrides.forbidOnly, userConfig.forbidOnly, false),
       fullyParallel: takeFirst(configCLIOverrides.fullyParallel, userConfig.fullyParallel, false),
       globalSetup: this.globalSetups[0] ?? null,
@@ -219,8 +221,13 @@ function resolveReporters(reporters: Config['reporter'], rootDir: string): Repor
 function resolveWorkers(workers: string | number): number {
   if (typeof workers === 'string') {
     if (workers.endsWith('%')) {
+      const percent = parseInt(workers, 10);
+      if (isNaN(percent))
+        throw new Error(`Workers ${workers} must be a number or percentage.`);
+      if (percent < 1)
+        throw new Error(`Workers must be a positive number, received ${percent}.`);
       const cpus = os.cpus().length;
-      return Math.max(1, Math.floor(cpus * (parseInt(workers, 10) / 100)));
+      return Math.max(1, Math.floor(cpus * (percent / 100)));
     }
     const parsedWorkers = parseInt(workers, 10);
     if (isNaN(parsedWorkers))

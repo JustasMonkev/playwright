@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
+import { splitTestIdAttributeNames } from '@isomorphic/locatorUtils';
 import { escapeForAttributeSelector, escapeForTextSelector, escapeRegExp, quoteCSSAttributeValue } from '@isomorphic/stringUtils';
 
 import { beginDOMCaches, closestCrossShadow, endDOMCaches, isElementVisible, isInsideScope, parentElementOrShadowHost } from './domUtils';
-import { beginAriaCaches, endAriaCaches, getAriaRole, getElementAccessibleDescription, getElementAccessibleName } from './roleUtils';
+import { beginAriaCaches, endAriaCaches, getAriaRole, getElementAccessibleDescription, getElementAccessibleNameText } from './roleUtils';
 import { elementText, getElementLabels } from './selectorUtils';
 
 import type { InjectedScript } from './injectedScript';
@@ -231,11 +232,12 @@ function generateSelectorFor(cache: Cache, injectedScript: InjectedScript, targe
 
 function buildNoTextCandidates(injectedScript: InjectedScript, element: Element, options: InternalOptions): SelectorToken[] {
   const candidates: SelectorToken[] = [];
+  const testIdAttributeNames = splitTestIdAttributeNames(options.testIdAttributeName);
 
   // CSS selectors are applicable to elements via locator() and iframes via frameLocator().
   {
     for (const attr of ['data-testid', 'data-test-id', 'data-test']) {
-      if (attr !== options.testIdAttributeName && element.getAttribute(attr))
+      if (!testIdAttributeNames.includes(attr) && element.getAttribute(attr))
         candidates.push({ engine: 'css', selector: `[${attr}=${quoteCSSAttributeValue(element.getAttribute(attr)!)}]`, score: kOtherTestIdScore });
     }
 
@@ -248,23 +250,27 @@ function buildNoTextCandidates(injectedScript: InjectedScript, element: Element,
     candidates.push({ engine: 'css', selector: escapeNodeName(element), score: kCSSTagNameScore });
   }
 
-  if (element.nodeName === 'IFRAME') {
+  if (element.nodeName === 'IFRAME' || element.nodeName === 'FRAME') {
     for (const attribute of ['name', 'title']) {
       if (element.getAttribute(attribute))
         candidates.push({ engine: 'css', selector: `${escapeNodeName(element)}[${attribute}=${quoteCSSAttributeValue(element.getAttribute(attribute)!)}]`, score: kIframeByAttributeScore });
     }
 
     // Locate by testId via CSS selector.
-    if (element.getAttribute(options.testIdAttributeName))
-      candidates.push({ engine: 'css', selector: `[${options.testIdAttributeName}=${quoteCSSAttributeValue(element.getAttribute(options.testIdAttributeName)!)}]`, score: kTestIdScore });
+    for (const testIdAttr of testIdAttributeNames) {
+      if (element.getAttribute(testIdAttr))
+        candidates.push({ engine: 'css', selector: `[${testIdAttr}=${quoteCSSAttributeValue(element.getAttribute(testIdAttr)!)}]`, score: kTestIdScore });
+    }
 
     penalizeScoreForLength([candidates]);
     return candidates;
   }
 
   // Everything below is not applicable to iframes (getBy* methods).
-  if (element.getAttribute(options.testIdAttributeName))
-    candidates.push({ engine: 'internal:testid', selector: `[${options.testIdAttributeName}=${escapeForAttributeSelector(element.getAttribute(options.testIdAttributeName)!, true)}]`, score: kTestIdScore });
+  for (const testIdAttr of testIdAttributeNames) {
+    if (element.getAttribute(testIdAttr))
+      candidates.push({ engine: 'internal:testid', selector: `[${testIdAttr}=${escapeForAttributeSelector(element.getAttribute(testIdAttr)!, true)}]`, score: kTestIdScore });
+  }
 
   if (element.nodeName === 'INPUT' || element.nodeName === 'TEXTAREA') {
     const input = element as HTMLInputElement | HTMLTextAreaElement;
@@ -342,7 +348,7 @@ function buildTextCandidates(injectedScript: InjectedScript, element: Element, i
 
   const ariaRole = getAriaRole(element);
   if (ariaRole && !['none', 'presentation'].includes(ariaRole)) {
-    const ariaName = getElementAccessibleName(element, false);
+    const ariaName = getElementAccessibleNameText(element, false);
     // \p{Co} means "Private Use" characters - these are often used for icon fonts and make for bad locators.
     if (ariaName && !ariaName.match(/^\p{Co}+$/u)) {
       const roleToken = { engine: 'internal:role', selector: `${ariaRole}[name=${escapeForAttributeSelector(ariaName, true)}]`, score: kRoleWithNameScoreExact };
@@ -353,7 +359,7 @@ function buildTextCandidates(injectedScript: InjectedScript, element: Element, i
       if (ariaDescription) {
         candidates.push([{ engine: 'internal:role', selector: `${ariaRole}[name=${escapeForAttributeSelector(ariaName, true)}][description=${escapeForAttributeSelector(ariaDescription, true)}]`, score: kRoleWithNameScoreExact + 1 }]);
         for (const alternative of suitableTextAlternatives(ariaName))
-          candidates.push([{ engine: 'internal:role', selector: `${ariaRole}[name=${escapeForAttributeSelector(alternative.text, false)}][description=${escapeForAttributeSelector(ariaDescription, true)}]`, score: kRoleWithNameScore - alternative.scoreBonus + 1 }]);
+          candidates.push([{ engine: 'internal:role', selector: `${ariaRole}[name=${escapeForAttributeSelector(alternative.text, false)}][description=${escapeForAttributeSelector(ariaDescription, false)}]`, score: kRoleWithNameScore - alternative.scoreBonus + 1 }]);
       }
     } else {
       const roleToken = { engine: 'internal:role', selector: `${ariaRole}`, score: kRoleWithoutNameScore };

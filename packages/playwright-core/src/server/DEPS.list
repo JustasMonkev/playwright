@@ -1,11 +1,10 @@
 [*]
 @isomorphic/**
+@protocol/**
 @utils/**
 ../generated/
 ../package.ts
-../protocol/
 ./
-./codegen/
 ./har/
 ./recorder/
 ./registry/
@@ -25,6 +24,7 @@ node_modules/yazl
 ./android/
 ./bidi/
 ./chromium/
+./electron/
 ./firefox/
 ./webkit/
 

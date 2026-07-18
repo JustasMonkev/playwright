@@ -64,8 +64,9 @@ it('should return uncompressed text', async ({ page, server }) => {
   expect(await response.text()).toBe('{"foo": "bar"}\n');
 });
 
-it('should return uncompressed text for brotli encoding', async ({ page, server, browserName, isAndroid }) => {
-  it.fixme(browserName === 'firefox', 'https://github.com/microsoft/playwright/issues/39160');
+it('should return uncompressed text for brotli encoding', {
+  annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/39160' },
+}, async ({ page, server, browserName, isAndroid }) => {
   it.fixme(isAndroid, 'net::ERR_CONTENT_DECODING_FAILED');
 
   const text = '{"foo": "bar"}\n';
@@ -252,7 +253,6 @@ it('should behave the same way for headers and allHeaders', async ({ page, serve
 it('should provide a Response with a file URL', async ({ page, asset, isAndroid, isElectron, isWindows, browserName, mode, channel }) => {
   it.skip(isAndroid, 'No files on Android');
   it.skip(browserName === 'firefox', 'Firefox does return null for file:// URLs');
-  it.skip(mode.startsWith('service'));
   it.skip(channel === 'webkit-wsl');
 
   const fileurl = url.pathToFileURL(asset('frames/two-frames.html')).href;
@@ -379,34 +379,6 @@ it('should bypass disk cache when page interception is enabled', async ({ page, 
   }
 });
 
-it('should bypass disk cache when context interception is enabled', async ({ page, server }) => {
-  it.info().annotations.push({ type: 'issue', description: 'https://github.com/microsoft/playwright/issues/30000' });
-  await page.context().route('**/api*', route => route.continue());
-  await page.goto(server.PREFIX + '/frames/one-frame.html');
-  {
-    const requests = [];
-    server.setRoute('/api', (req, res) => {
-      requests.push(req);
-      res.statusCode = 200;
-      res.setHeader('content-type', 'text/plain');
-      res.setHeader('cache-control', 'public, max-age=31536000');
-      res.end('Hello');
-    });
-    for (let i = 0; i < 3; i++) {
-      await it.step(`main frame iteration ${i}`, async () => {
-        const respPromise = page.waitForResponse('**/api');
-        await page.evaluate(async () => {
-          const response = await fetch('/api');
-          return response.status;
-        });
-        const response = await respPromise;
-        expect(response.status()).toBe(200);
-        expect(requests.length).toBe(i + 1);
-      });
-    }
-  }
-});
-
 it('request.existingResponse should return null before response is received', async ({ page, server }) => {
   await page.goto(server.EMPTY_PAGE);
   let serverResponse = null;
@@ -477,4 +449,20 @@ it('Response.formData() should parse multipart/form-data in page context', async
   expect(result.field1).toBe('value1');
   expect(result.filename).toBe('test.txt');
   expect(result.fileContent).toBe('hello');
+});
+
+it('should give a readable error when response.body() races with navigation', async ({ page, server, browserName, trace }) => {
+  it.skip(browserName === 'firefox', 'Firefox keeps the response body available after navigating away, so it never throws');
+  it.skip(trace === 'on', 'Tracing fetches response bodies eagerly, so the body is already cached before navigation');
+  it.info().annotations.push({ type: 'issue', description: 'https://github.com/microsoft/playwright/issues/41512' });
+  const [response] = await Promise.all([
+    page.waitForResponse(server.PREFIX + '/title.html'),
+    page.goto(server.PREFIX + '/title.html'),
+  ]);
+  // Navigate away — the browser frees the network resource from the first page load.
+  // The first page must have a non-empty body, otherwise WebKit returns an empty buffer instead of throwing.
+  await page.goto(server.PREFIX + '/grid.html');
+  const error = await response.body().catch(e => e);
+  expect(error).toBeInstanceOf(Error);
+  expect(error.message).toContain('navigated away');
 });

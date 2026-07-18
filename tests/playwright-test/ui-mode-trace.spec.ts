@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+
 import { createImage } from './playwright-test-fixtures';
 import { test, expect, retries } from './ui-mode-fixtures';
 
@@ -416,6 +420,10 @@ test('should show request source context id', async ({ runUITest, server }) => {
         const page2 = await context.newPage();
         await page2.goto('${server.EMPTY_PAGE}');
         await request.get('${server.EMPTY_PAGE}');
+        console.log('log from node');
+        console.error('error from node');
+        await page.evaluate(() => console.log('here from page1'));
+        await page2.evaluate(() => console.log('here from page2'));
       });
     `,
   });
@@ -428,6 +436,13 @@ test('should show request source context id', async ({ runUITest, server }) => {
   await expect(page.getByText('page#1')).toBeVisible();
   await expect(page.getByText('page#2')).toBeVisible();
   await expect(page.getByText('api#1')).toBeVisible();
+
+  await page.getByText('Console', { exact: true }).click();
+  const consoleLines = page.getByRole('tabpanel', { name: 'Console' }).getByRole('option');
+  await expect(consoleLines.filter({ hasText: 'log from node' }).locator('.console-source')).toHaveText('test');
+  await expect(consoleLines.filter({ hasText: 'error from node' }).locator('.console-source')).toHaveText('test');
+  await expect(consoleLines.filter({ hasText: 'here from page1' }).locator('.console-source')).toHaveText('page#1');
+  await expect(consoleLines.filter({ hasText: 'here from page2' }).locator('.console-source')).toHaveText('page#2');
 });
 
 test('should work behind reverse proxy', { annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/33705' } }, async ({ runUITest, proxyServer: reverseProxy }) => {
@@ -744,7 +759,7 @@ test('should be able to create and dispose APIRequestContext inside Promise.all'
   await page.getByText('create api request contexts').dblclick();
   await expect(page.getByTestId('workbench-run-status')).toContainText('Passed');
 
-  await expect(page.getByTestId('status-line')).toHaveText('1/1 passed (100%)');
+  await expect(page.getByTestId('status-line')).toHaveText('1/1 (100%) — 1 passed');
 
   await page.getByText('Errors', { exact: true }).click();
   await expect(page.locator('.tab-errors')).toHaveText('No errors');
@@ -840,4 +855,37 @@ test('should update state on subsequent run', async ({ runUITest, writeFiles }) 
   await expect(page).toMatchAriaSnapshot(`
     - treeitem /Expect \"toBe\"/
   `);
+});
+
+test('should load trace when outputDir is outside cwd', {
+  annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/40950' },
+}, async ({ runUITest }) => {
+  const outputDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'pw-outputdir-'));
+  try {
+    const { page } = await runUITest({
+      'playwright.config.ts': `
+        import { defineConfig } from '@playwright/test';
+        export default defineConfig({
+          outputDir: ${JSON.stringify(outputDir)},
+        });
+      `,
+      'a.test.ts': `
+        import { test, expect } from '@playwright/test';
+        test('trace test', async ({ page }) => {
+          await page.setContent('<button>Submit</button>');
+        });
+      `,
+    });
+
+    await page.getByText('trace test').dblclick();
+
+    const listItem = page.getByTestId('actions-tree').getByRole('treeitem');
+    await expect(listItem, 'action list').toHaveText([
+      /Before Hooks/,
+      /Set content/,
+      /After Hooks/,
+    ]);
+  } finally {
+    await fs.promises.rm(outputDir, { recursive: true, force: true });
+  }
 });

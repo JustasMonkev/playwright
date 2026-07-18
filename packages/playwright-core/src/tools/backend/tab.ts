@@ -78,6 +78,7 @@ export type TabHeader = {
   url: string;
   current: boolean;
   crashed: boolean;
+  mainDocumentStatus?: { status: number, statusText: string };
   console: { total: number, warnings: number, errors: number };
 };
 
@@ -102,6 +103,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   private _lastHeader: TabHeader = { title: 'about:blank', url: 'about:blank', current: false, crashed: false, console: { total: 0, warnings: 0, errors: 0 } };
   private _downloads: Download[] = [];
   private _requests: playwright.Request[] = [];
+  private _mainDocumentStatus: { status: number, statusText: string } | undefined;
   private _onPageClose: (tab: Tab) => void;
   crashed = false;
   private _modalStates: ModalState[] = [];
@@ -156,6 +158,10 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   async dispose() {
     await disposeAll(this._disposables);
     this._consoleLog.stop();
+  }
+
+  async waitForInitialized() {
+    await this._initializedPromise;
   }
 
   static forPage(page: playwright.Page): Tab | undefined {
@@ -231,6 +237,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   private _clearCollectedArtifacts() {
     this._downloads.length = 0;
     this._requests.length = 0;
+    this._mainDocumentStatus = undefined;
     this._recentEventEntries.length = 0;
     this._resetLogs();
   }
@@ -250,9 +257,12 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   }
 
   private _handleResponse(response: playwright.Response) {
-    const timing = response.request().timing();
+    const request = response.request();
+    if (request.isNavigationRequest() && response.frame() === this.page.mainFrame() && !request.redirectedTo())
+      this._mainDocumentStatus = { status: response.status(), statusText: response.statusText() };
+    const timing = request.timing();
     const wallTime = timing.responseStart + timing.startTime;
-    this._addLogEntry({ type: 'request', wallTime, request: response.request() });
+    this._addLogEntry({ type: 'request', wallTime, request });
     this._trackPdfDocument(response);
   }
 
@@ -290,7 +300,6 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   }
 
   private _handleRequestFailed(request: playwright.Request) {
-    this._requests.push(request);
     const timing = request.timing();
     const wallTime = timing.responseEnd + timing.startTime;
     this._addLogEntry({ type: 'request', wallTime, request });
@@ -330,6 +339,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       url: this.page.url(),
       current: this.isCurrentTab(),
       crashed: this.crashed,
+      mainDocumentStatus: this._mainDocumentStatus,
       console: consoleCounts,
     };
 
@@ -556,7 +566,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       return;
     }
 
-    await this.page.evaluate(() => new Promise(f => setTimeout(f, 1000))).catch(() => {});
+    await this.page.evaluate(ms => new Promise(f => setTimeout(f, ms)), time).catch(() => {});
   }
 }
 
@@ -667,6 +677,8 @@ function tabHeaderEquals(a: TabHeader, b: TabHeader): boolean {
       a.url === b.url &&
       a.current === b.current &&
       a.crashed === b.crashed &&
+      a.mainDocumentStatus?.status === b.mainDocumentStatus?.status &&
+      a.mainDocumentStatus?.statusText === b.mainDocumentStatus?.statusText &&
       a.console.errors === b.console.errors &&
       a.console.warnings === b.console.warnings &&
       a.console.total === b.console.total;

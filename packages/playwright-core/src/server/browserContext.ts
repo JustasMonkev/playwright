@@ -17,9 +17,10 @@
 
 import fs from 'fs';
 
-import { rewriteErrorMessage } from '@isomorphic/stackTrace';
+import { rewriteErrorMessage } from '@utils/stackTrace';
 import { debugMode, isUnderTest } from '@utils/debug';
 import { Clock } from './clock';
+import { Credentials } from './credentials';
 import { Debugger } from './debugger';
 import { DialogManager } from './dialog';
 import { BrowserContextAPIRequestContext } from './fetch';
@@ -38,12 +39,14 @@ import type { Browser, BrowserOptions } from './browser';
 import type { ConsoleMessage } from './console';
 import type { Download } from './download';
 import type * as frames from './frames';
+import type { HarBackend } from './harBackend';
 import type { PageError } from './page';
 import type { Progress } from './progress';
 import type { ClientCertificatesProxy } from './socksClientCertificatesInterceptor';
 import type { SerializedStorage } from '@injected/storageScript';
 import type * as types from './types';
-import type * as channels from '@protocol/channels';
+import type { URLMatch } from '@isomorphic/urlMatch';
+import type * as channels from './channels';
 
 const BrowserContextEvent = {
   Console: 'console',
@@ -63,6 +66,8 @@ const BrowserContextEvent = {
   RecorderEvent: 'recorderevent',
   PageClosed: 'pageclosed',
   InternalFrameNavigatedToNewDocument: 'internalframenavigatedtonewdocument',
+  FrameAttached: 'frameattached',
+  WebSocket: 'websocket',
 } as const;
 
 export type BrowserContextEventMap = {
@@ -80,7 +85,9 @@ export type BrowserContextEventMap = {
   [BrowserContextEvent.BeforeClose]: [];
   [BrowserContextEvent.RecorderEvent]: [event: { event: 'actionAdded' | 'actionUpdated' | 'signalAdded', data: any, page: Page, code: string }];
   [BrowserContextEvent.PageClosed]: [page: Page];
-  [BrowserContextEvent.InternalFrameNavigatedToNewDocument]: [frame: frames.Frame, page: Page];
+  [BrowserContextEvent.InternalFrameNavigatedToNewDocument]: [frame: frames.Frame];
+  [BrowserContextEvent.FrameAttached]: [frame: frames.Frame];
+  [BrowserContextEvent.WebSocket]: [webSocket: network.WebSocket, page: Page];
 };
 
 export abstract class BrowserContext<EM extends EventMap = EventMap> extends SdkObject<BrowserContextEventMap | EM> {
@@ -110,10 +117,12 @@ export abstract class BrowserContext<EM extends EventMap = EventMap> extends Sdk
   private _debugger!: Debugger;
   _closeReason: string | undefined;
   readonly clock: Clock;
+  readonly credentials: Credentials;
   _clientCertificatesProxy: ClientCertificatesProxy | undefined;
   private _playwrightBindingExposed?: Promise<void>;
   readonly dialogManager: DialogManager;
   private _consoleApiExposed = false;
+  private _harForAPIRequests: HarForAPIRequestsRegistration[] = [];
 
   constructor(browser: Browser, options: types.BrowserContextOptions, browserContextId: string | undefined) {
     super(browser, 'browser-context');
@@ -128,6 +137,7 @@ export abstract class BrowserContext<EM extends EventMap = EventMap> extends Sdk
     this.fetchRequest = new BrowserContextAPIRequestContext(this);
     this.tracing = new Tracing(this, browser.options.tracesDir);
     this.clock = new Clock(this);
+    this.credentials = new Credentials(this);
     this.dialogManager = new DialogManager(this.instrumentation);
   }
 
@@ -227,7 +237,7 @@ export abstract class BrowserContext<EM extends EventMap = EventMap> extends Sdk
     const otherPages = this.possiblyUninitializedPages().filter(p => p !== page);
     for (const p of otherPages)
       await p.close(progress);
-    if (page && page.hasCrashed()) {
+    if (page && page.isClosedOrClosingOrCrashed()) {
       await page.close(progress);
       page = undefined;
     }
@@ -258,6 +268,7 @@ export abstract class BrowserContext<EM extends EventMap = EventMap> extends Sdk
       // at the same time.
       return;
     }
+    this._closedStatus = 'closed';
     this._clientCertificatesProxy?.close().catch(() => {});
     this.tracing.abort();
     if (this._isPersistentContext)
@@ -305,8 +316,11 @@ export abstract class BrowserContext<EM extends EventMap = EventMap> extends Sdk
   }
 
   async clearCookies(options: {name?: string | RegExp, domain?: string | RegExp, path?: string | RegExp}): Promise<void> {
-    const currentCookies = await this._cookies();
-    await this.doClearCookies();
+    const hasFilter = options.name !== undefined || options.domain !== undefined || options.path !== undefined;
+    if (!hasFilter) {
+      await this.doClearCookies();
+      return;
+    }
 
     const matches = (cookie: channels.NetworkCookie, prop: 'name' | 'domain' | 'path', value: string | RegExp | undefined) => {
       if (!value)
@@ -318,13 +332,21 @@ export abstract class BrowserContext<EM extends EventMap = EventMap> extends Sdk
       return cookie[prop] === value;
     };
 
-    const cookiesToReadd = currentCookies.filter(cookie => {
-      return !matches(cookie, 'name', options.name)
-        || !matches(cookie, 'domain', options.domain)
-        || !matches(cookie, 'path', options.path);
+    const currentCookies = await this._cookies();
+    const cookiesToExpire = currentCookies.filter(cookie => {
+      return matches(cookie, 'name', options.name)
+        && matches(cookie, 'domain', options.domain)
+        && matches(cookie, 'path', options.path);
     });
 
-    await this.addCookies(cookiesToReadd);
+    if (!cookiesToExpire.length)
+      return;
+
+    await this.addCookies(cookiesToExpire.map(cookie => ({
+      ...cookie,
+      value: '',
+      expires: 0,
+    })));
   }
 
   setHTTPCredentials(progress: Progress, httpCredentials?: types.Credentials): Promise<void> {
@@ -527,7 +549,7 @@ export abstract class BrowserContext<EM extends EventMap = EventMap> extends Sdk
   }
 
   private async _deleteAllTempDirs(): Promise<void> {
-    await Promise.all(this._tempDirs.map(async dir => await fs.promises.unlink(dir).catch(e => {})));
+    await Promise.all(this._tempDirs.map(async dir => await fs.promises.rm(dir, { recursive: true, force: true }).catch(e => {})));
   }
 
   setCustomCloseHandler(handler: (() => Promise<any>) | undefined) {
@@ -591,11 +613,13 @@ export abstract class BrowserContext<EM extends EventMap = EventMap> extends Sdk
     this._origins.add(origin);
   }
 
-  async storageState(progress: Progress, indexedDB = false): Promise<channels.BrowserContextStorageStateResult> {
+  async storageState(progress: Progress, indexedDB = false, credentials = false): Promise<channels.BrowserContextStorageStateResult> {
     const result: channels.BrowserContextStorageStateResult = {
       cookies: await this.cookies(progress),
       origins: []
     };
+    if (credentials)
+      result.credentials = await progress.race(this.credentials.get());
     const originsToSave = new Set(this._origins);
 
     const collectScript = `(() => {
@@ -652,10 +676,20 @@ export abstract class BrowserContext<EM extends EventMap = EventMap> extends Sdk
       if (mode !== 'initial') {
         await progress.race(this.clearCache());
         await progress.race(this.doClearCookies());
+        if (state?.credentials?.length)
+          this.credentials.clear();
+        else
+          await this.credentials.dispose(progress);
       }
 
       if (state?.cookies)
         await progress.race(this.addCookies(state.cookies));
+
+      if (state?.credentials?.length) {
+        for (const credential of state.credentials)
+          await progress.race(this.credentials.create(credential));
+        await this.credentials.install(progress);
+      }
 
       const newOrigins = new Map(state?.origins?.map(p => [p.origin, p]) || []);
       const allOrigins = new Set([...this._origins, ...newOrigins.keys()]);
@@ -719,15 +753,49 @@ export abstract class BrowserContext<EM extends EventMap = EventMap> extends Sdk
   async notifyRoutesInFlightAboutRemovedHandler(handler: network.RouteHandler): Promise<void> {
     await Promise.all([...this._routesInFlight].map(route => route.removeHandler(handler)));
   }
+
+  routeAPIRequestsFromHar(options: { harBackend: HarBackend, urlMatch: URLMatch | undefined, notFound: 'abort' | 'fallback', baseURL: string | undefined }): { dispose: () => void } {
+    const registration: HarForAPIRequestsRegistration = {
+      harBackend: options.harBackend,
+      urlMatch: options.urlMatch,
+      notFound: options.notFound,
+      baseURL: options.baseURL,
+    };
+    // Give priority to the newest registration, mirroring BrowserContext.route/Page.route.
+    this._harForAPIRequests.unshift(registration);
+    return {
+      dispose: () => {
+        const index = this._harForAPIRequests.indexOf(registration);
+        if (index !== -1)
+          this._harForAPIRequests.splice(index, 1);
+      },
+    };
+  }
+
+  harForAPIRequests(): readonly HarForAPIRequestsRegistration[] {
+    return this._harForAPIRequests;
+  }
 }
+
+export type HarForAPIRequestsRegistration = {
+  harBackend: HarBackend;
+  urlMatch: URLMatch | undefined;
+  notFound: 'abort' | 'fallback';
+  baseURL: string | undefined;
+};
 
 export function validateBrowserContextOptions(options: types.BrowserContextOptions, browserOptions: BrowserOptions) {
   if (options.noDefaultViewport && options.deviceScaleFactor !== undefined)
     throw new Error(`"deviceScaleFactor" option is not supported with null "viewport"`);
   if (options.noDefaultViewport && !!options.isMobile)
     throw new Error(`"isMobile" option is not supported with null "viewport"`);
-  if (options.acceptDownloads === undefined)
+  if (options.acceptDownloads === undefined && browserOptions.name !== 'electron')
     options.acceptDownloads = 'accept';
+  // Electron requires explicit acceptDownloads: true since we wait for
+  // https://github.com/electron/electron/pull/41718 to be widely shipped.
+  // In 6-12 months, we can remove this check.
+  else if (options.acceptDownloads === undefined && browserOptions.name === 'electron')
+    options.acceptDownloads = 'internal-browser-default';
   if (!options.viewport && !options.noDefaultViewport)
     options.viewport = { width: 1280, height: 720 };
   if (options.proxy)

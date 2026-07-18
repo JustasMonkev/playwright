@@ -69,9 +69,9 @@ it('should be able to click across browser contexts', async function({ browser }
   await page2.close();
 });
 
-it('should be able to hover across browser contexts in parallel', async function({ browser, browserName }) {
-  it.fixme(browserName === 'firefox');
+it('should be able to hover across browser contexts in parallel', async function({ browser, browserName, headless }) {
   it.info().annotations.push({ type: 'issue', description: 'https://github.com/microsoft/playwright/issues/40562' });
+  it.fixme(browserName === 'firefox' && !headless, 'Hover is flaky in headed Firefox');
 
   const html = `
     <style>
@@ -376,9 +376,9 @@ it('should emulate offline event', { annotation: { type: 'issue', description: '
     return events;
   });
   await context.setOffline(true);
-  expect(await events.jsonValue()).toEqual(['offline']);
+  await expect.poll(() => events.jsonValue()).toEqual(['offline']);
   await context.setOffline(false);
-  expect(await events.jsonValue()).toEqual(['offline', 'online']);
+  await expect.poll(() => events.jsonValue()).toEqual(['offline', 'online']);
   await context.close();
 });
 

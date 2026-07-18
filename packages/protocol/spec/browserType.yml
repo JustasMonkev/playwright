@@ -43,14 +43,15 @@ BrowserType:
     connectOverCDP:
       title: Connect over CDP
       parameters:
-        endpointURL: string
+        endpointURL: string?
         headers:
           type: array?
           items: NameValue
         slowMo: float?
-        timeout: float
         isLocal: boolean?
         noDefaults: boolean?
+        artifactsDir: string?
+        transport: binary?
       returns:
         browser: Browser
         defaultContext: BrowserContext?
@@ -59,6 +60,5 @@ BrowserType:
       title: Connect to worker
       parameters:
         endpoint: string
-        timeout: float
       returns:
         worker: Worker

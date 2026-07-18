@@ -94,6 +94,21 @@ test('browser_network_requests filter', async ({ client, server }) => {
   }
 });
 
+test('browser_network_requests rejects invalid regex filter', async ({ client, server }) => {
+  server.setContent('/', '', 'text/html');
+
+  await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX },
+  });
+
+  const response = await client.callTool({
+    name: 'browser_network_requests',
+    arguments: { filter: '[invalid(' },
+  });
+  expect(response.isError).toBe(true);
+});
+
 test('browser_network_requests numbers requests with stable indexes', async ({ client, server }) => {
   server.setContent('/', '', 'text/html');
 
@@ -190,6 +205,21 @@ test('browser_network_request reports failed requests', async ({ client, server 
   }));
   expect(detail!.result).toContain(`#${match![1]} [GET] ${server.PREFIX}/missing.png`);
   expect(detail!.result).toContain('status:    [404]');
+});
+
+test('browser_network_requests lists a failed request once', async ({ client, server }) => {
+  server.setContent('/', `<img src="http://does-not-exist.invalid/api/x" />`, 'text/html');
+
+  await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX },
+  });
+
+  const list = parseResponse(await client.callTool({
+    name: 'browser_network_requests',
+    arguments: { static: true },
+  }));
+  expect([...list!.result!.matchAll(/\/api\/x =>/g)]).toHaveLength(1);
 });
 
 test('browser_network_request returns individual parts', async ({ client, server }) => {

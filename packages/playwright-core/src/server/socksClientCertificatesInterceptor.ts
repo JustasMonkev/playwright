@@ -26,13 +26,13 @@ import { debugLogger } from '@utils/debugLogger';
 import { createSocket } from '@utils/happyEyeballs';
 import { escapeHTML } from '@isomorphic/stringUtils';
 import { generateSelfSignedCertificate } from '@utils/crypto';
-import { rewriteErrorMessage } from '@isomorphic/stackTrace';
+import { rewriteErrorMessage } from '@utils/stackTrace';
 import { createProxyAgent } from '@utils/network';
 import { verifyClientCertificates } from './browserContext';
 import type * as types from './types';
 import type { SocksSocketClosedPayload, SocksSocketDataPayload, SocksSocketRequestedPayload } from '@utils/socksProxy';
 import type https from 'https';
-import type { Progress } from '@protocol/progress';
+import type { Progress } from './progress';
 
 let dummyServerTlsOptions: tls.TlsOptions | undefined = undefined;
 function loadDummyServerCertsIfNeeded() {
@@ -160,9 +160,11 @@ class SocksProxyConnection {
     // the protocol on the first package and attach appropriate listeners.
     if (!this._firstPackageReceived) {
       this._firstPackageReceived = true;
-      // 0x16 is SSLv3/TLS "handshake" content type: https://en.wikipedia.org/wiki/Transport_Layer_Security#TLS_record
-      if (data[0] === 0x16)
-        this._establishTlsTunnel(this._browserEncrypted, data);
+      // 0x16 is the TLS "handshake" content type. Only intercept it when the origin has a client
+      // certificate; otherwise pass the connection through so the browser talks TLS to the server directly.
+      const secureContext = data[0] === 0x16 ? this.socksProxy.secureContextMap.get(normalizeOrigin(`https://${this.host}:${this.port}`)) : undefined;
+      if (secureContext)
+        this._establishTlsTunnel(this._browserEncrypted, data, secureContext);
       else
         this._establishPlaintextTunnel(this._browserEncrypted);
     }
@@ -176,18 +178,20 @@ class SocksProxyConnection {
     this._serverEncrypted.pipe(browserEncrypted);
   }
 
-  private _establishTlsTunnel(browserEncrypted: stream.Duplex, clientHello: Buffer) {
+  private _establishTlsTunnel(browserEncrypted: stream.Duplex, clientHello: Buffer, secureContext: tls.SecureContext) {
     const browserALPNProtocols = parseALPNFromClientHello(clientHello) || ['http/1.1'];
     debugLogger.log('client-certificates', `Browser->Proxy ${this.host}:${this.port} offers ALPN ${browserALPNProtocols}`);
+
+    const rejectUnauthorized = !this.socksProxy.ignoreHTTPSErrors;
 
     const serverDecrypted = tls.connect({
       socket: this._serverEncrypted,
       host: this.host,
       port: this.port,
-      rejectUnauthorized: !this.socksProxy.ignoreHTTPSErrors,
+      rejectUnauthorized,
       ALPNProtocols: browserALPNProtocols,
       servername: !net.isIP(this.host) ? this.host : undefined,
-      secureContext: this.socksProxy.secureContextMap.get(new URL(`https://${this.host}:${this.port}`).origin),
+      secureContext,
     }, async () => {
       const browserDecrypted = await this._upgradeToTLSIfNeeded(browserEncrypted, serverDecrypted.alpnProtocol);
       debugLogger.log('client-certificates', `Proxy->Server ${this.host}:${this.port} chooses ALPN ${browserDecrypted.alpnProtocol}`);
@@ -220,7 +224,6 @@ class SocksProxyConnection {
       if (browserDecrypted.alpnProtocol === 'h2') {
         // This method is available only in Node.js 20+
         if ('performServerHandshake' in http2) {
-          // @ts-expect-error
           const session: http2.ServerHttp2Session = http2.performServerHandshake(browserDecrypted);
           session.on('error', error => {
             this._browserEncrypted.destroy(error);

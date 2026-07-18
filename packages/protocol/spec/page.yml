@@ -15,8 +15,6 @@
 Page:
   type: interface
 
-  extends: EventTarget
-
   initializer:
     mainFrame: Frame
     viewportSize:
@@ -41,8 +39,12 @@ Page:
     close:
       title: Close page
       parameters:
-        runBeforeUnload: boolean?
         reason: string?
+      flags:
+        pause: true
+
+    runBeforeUnload:
+      title: Run beforeunload
       flags:
         pause: true
 
@@ -105,13 +107,13 @@ Page:
       group: configuration
       parameters:
         name: string
+        noGlobal: boolean?
       returns:
         disposable: Disposable
 
     goBack:
       title: Go back
       parameters:
-        timeout: float
         waitUntil: LifecycleEvent?
       returns:
         response: Response?
@@ -123,7 +125,6 @@ Page:
     goForward:
       title: Go forward
       parameters:
-        timeout: float
         waitUntil: LifecycleEvent?
       returns:
         response: Response?
@@ -158,7 +159,6 @@ Page:
     reload:
       title: Reload
       parameters:
-        timeout: float
         waitUntil: LifecycleEvent?
       returns:
         response: Response?
@@ -171,7 +171,6 @@ Page:
       title: Expect screenshot
       parameters:
         expected: binary?
-        timeout: float
         isNot: boolean
         locator:
           type: object?
@@ -184,10 +183,17 @@ Page:
         threshold: float?
         fullPage: boolean?
         clip: Rect?
+        type:
+          type: enum?
+          literals:
+          - png
+          - webp
         $mixin: CommonScreenshotOptions
       returns:
+        actual: binary?
+      errorDetails:
         diff: binary?
-        errorMessage: string?
+        customErrorMessage: string?
         actual: binary?
         previous: binary?
         timedOut: boolean?
@@ -201,12 +207,12 @@ Page:
     screenshot:
       title: Screenshot
       parameters:
-        timeout: float
         type:
           type: enum?
           literals:
           - png
           - jpeg
+          - webp
         quality: int?
         fullPage: boolean?
         clip: Rect?
@@ -604,6 +610,66 @@ Page:
       parameters:
         image: binary
 
+    webStorageItems:
+      title: Get WebStorage items
+      group: getter
+      parameters:
+        kind:
+          type: enum
+          literals:
+          - local
+          - session
+      returns:
+        items:
+          type: array
+          items: NameValue
+
+    webStorageGetItem:
+      title: Get WebStorage item
+      group: getter
+      parameters:
+        kind:
+          type: enum
+          literals:
+          - local
+          - session
+        name: string
+      returns:
+        value: string?
+
+    webStorageSetItem:
+      title: Set WebStorage item
+      group: configuration
+      parameters:
+        kind:
+          type: enum
+          literals:
+          - local
+          - session
+        name: string
+        value: string
+
+    webStorageRemoveItem:
+      title: Remove WebStorage item
+      group: configuration
+      parameters:
+        kind:
+          type: enum
+          literals:
+          - local
+          - session
+        name: string
+
+    webStorageClear:
+      title: Clear WebStorage
+      group: configuration
+      parameters:
+        kind:
+          type: enum
+          literals:
+          - local
+          - session
+
   events:
 
     bindingCall:
@@ -652,6 +718,7 @@ Page:
     screencastFrame:
       parameters:
         data: binary
+        timestamp: float
         viewportWidth: int
         viewportHeight: int
 

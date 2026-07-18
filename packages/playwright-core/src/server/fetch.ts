@@ -23,7 +23,7 @@ import * as zlib from 'zlib';
 import { createGuid } from '@utils/crypto';
 import { httpHappyEyeballsAgent, httpsHappyEyeballsAgent, timingForSocket } from '@utils/happyEyeballs';
 import { assert } from '@isomorphic/assert';
-import { constructURLBasedOnBaseURL } from '@isomorphic/urlMatch';
+import { constructURLBasedOnBaseURL, urlMatches } from '@isomorphic/urlMatch';
 import { eventsHelper } from '@utils/eventsHelper';
 import { monotonicTime } from '@isomorphic/time';
 import { createProxyAgent } from '@utils/network';
@@ -31,10 +31,13 @@ import { getUserAgent } from './userAgent';
 import { BrowserContext, verifyClientCertificates } from './browserContext';
 import { Cookie, CookieStore, domainMatches, parseRawCookie } from './cookieStore';
 import { MultipartFormData } from './formData';
+import { TargetClosedError } from './errors';
 import { SdkObject } from './instrumentation';
 import { isAbortError } from './progress';
 import { getMatchingTLSOptionsForOrigin, rewriteOpenSSLErrorIfNeeded } from './socksClientCertificatesInterceptor';
 import { Tracing } from './trace/recorder/tracing';
+
+import type net from 'net';
 
 import type { Playwright } from './playwright';
 import type { Progress } from './progress';
@@ -42,7 +45,7 @@ import type * as types from './types';
 import type { HeadersArray, ProxySettings } from './types';
 import type { HTTPCredentials } from '../../types/types';
 import type { RegisteredListener } from '@utils/eventsHelper';
-import type * as channels from '@protocol/channels';
+import type * as channels from './channels';
 import type * as har from '@trace/har';
 import type { LookupAddress } from 'dns';
 import type { Readable, TransformCallback } from 'stream';
@@ -91,7 +94,11 @@ type SendRequestOptions = https.RequestOptions & {
   __testHookLookup?: (hostname: string) => LookupAddress[]
 };
 
-type SendRequestResult = Omit<channels.APIResponse, 'fetchUid'> & { body: Buffer };
+type SendRequestResult = {
+  body: Buffer,
+  log: string[],
+  response: Omit<channels.APIResponse, 'fetchUid'>,
+};
 
 export abstract class APIRequestContext extends SdkObject {
   static Events = {
@@ -105,6 +112,7 @@ export abstract class APIRequestContext extends SdkObject {
   readonly fetchLog: Map<string, string[]> = new Map();
   protected static allInstances: Set<APIRequestContext> = new Set();
   _closeReason: string | undefined;
+  private _disposed = false;
 
   static findResponseBody(guid: string): Buffer | undefined {
     for (const request of APIRequestContext.allInstances) {
@@ -142,7 +150,12 @@ export abstract class APIRequestContext extends SdkObject {
   abstract addCookies(cookies: channels.NetworkCookie[]): Promise<void>;
   abstract cookies(progress: Progress, url: URL): Promise<channels.NetworkCookie[]>;
 
+  protected async _lookupInHar(progress: Progress, url: URL, method: string, headers: HeadersObject, postData: Buffer | undefined, maxRedirects: number): Promise<SendRequestResult | undefined> {
+    return undefined;
+  }
+
   protected _disposeImpl() {
+    this._disposed = true;
     APIRequestContext.allInstances.delete(this);
     this.fetchResponses.clear();
     this.fetchLog.clear();
@@ -216,24 +229,26 @@ export abstract class APIRequestContext extends SdkObject {
     const postData = serializePostData(params, headers);
     if (postData)
       setHeader(headers, 'content-length', String(postData.byteLength));
-    const fetchResponse = await this._sendRequestWithRetries(progress, requestUrl, options, postData, params.maxRetries);
-    const fetchUid = this._storeResponseBody(fetchResponse.body);
-    this.fetchLog.set(fetchUid, progress.metadata.log);
+    const { body, log, response } =
+      (await this._lookupInHar(progress, requestUrl, method, headers, postData, maxRedirects)) ||
+      (await this._sendRequestWithRetries(progress, requestUrl, options, postData, params.maxRetries));
     const failOnStatusCode = params.failOnStatusCode !== undefined ? params.failOnStatusCode : !!defaults.failOnStatusCode;
-    if (failOnStatusCode && (fetchResponse.status < 200 || fetchResponse.status >= 400)) {
+    if (failOnStatusCode && (response.status < 200 || response.status >= 400)) {
       let responseText = '';
-      if (fetchResponse.body.byteLength) {
-        let text = fetchResponse.body.toString('utf8');
+      if (body.byteLength) {
+        let text = body.toString('utf8');
         if (text.length > 1000)
           text = text.substring(0, 997) + '...';
         responseText = `\nResponse text:\n${text}`;
       }
-      throw new Error(`${fetchResponse.status} ${fetchResponse.statusText}${responseText}`);
+      throw new Error(`${response.status} ${response.statusText}${responseText}`);
     }
-    return { ...fetchResponse, fetchUid };
+    const fetchUid = this._storeResponseBody(body);
+    this.fetchLog.set(fetchUid, log);
+    return { ...response, fetchUid };
   }
 
-  private _parseSetCookieHeader(responseUrl: string, setCookie: string[] | undefined): channels.NetworkCookie[] {
+  _parseSetCookieHeader(responseUrl: string, setCookie: string[] | undefined): channels.NetworkCookie[] {
     if (!setCookie)
       return [];
     const url = new URL(responseUrl);
@@ -260,7 +275,7 @@ export abstract class APIRequestContext extends SdkObject {
     return cookies;
   }
 
-  private async _updateRequestCookieHeader(progress: Progress, url: URL, headers: HeadersObject) {
+  async _updateRequestCookieHeader(progress: Progress, url: URL, headers: HeadersObject) {
     if (getHeader(headers, 'cookie') !== undefined)
       return;
     const contextCookies = await this.cookies(progress, url);
@@ -274,12 +289,13 @@ export abstract class APIRequestContext extends SdkObject {
     }
   }
 
-  private async _sendRequestWithRetries(progress: Progress, url: URL, options: SendRequestOptions, postData?: Buffer, maxRetries?: number): Promise<SendRequestResult>{
+  private async _sendRequestWithRetries(progress: Progress, url: URL, options: SendRequestOptions, postData?: Buffer, maxRetries?: number): Promise<SendRequestResult> {
+    const log: string[] = [];
     maxRetries ??= 0;
     let backoff = 250;
     for (let i = 0; i <= maxRetries; i++) {
       try {
-        return await this._sendRequest(progress, url, options, postData);
+        return await this._sendRequest(progress, log, url, options, postData);
       } catch (e) {
         if (isAbortError(e))
           throw e;
@@ -291,7 +307,9 @@ export abstract class APIRequestContext extends SdkObject {
         // Retry on connection reset only.
         if (e.code !== 'ECONNRESET')
           throw e;
-        progress.log(`  Received ECONNRESET, will retry after ${backoff}ms.`);
+        const message = `  Received ECONNRESET, will retry after ${backoff}ms.`;
+        log.push(message);
+        progress.log(message);
         await progress.wait(backoff);
         backoff *= 2;
       }
@@ -299,7 +317,11 @@ export abstract class APIRequestContext extends SdkObject {
     throw new Error('Unreachable');
   }
 
-  private async _sendRequest(progress: Progress, url: URL, options: SendRequestOptions, postData?: Buffer): Promise<SendRequestResult>{
+  private async _sendRequest(progress: Progress, log: string[], url: URL, options: SendRequestOptions, postData?: Buffer): Promise<SendRequestResult>{
+    const fetchLog = (message: string) => {
+      log.push(message);
+      progress.log(message);
+    };
     await this._updateRequestCookieHeader(progress, url, options.headers);
 
     const requestCookies = getHeader(options.headers, 'cookie')?.split(';').map(p => {
@@ -317,6 +339,9 @@ export abstract class APIRequestContext extends SdkObject {
     };
     this.emit(APIRequestContext.Events.Request, requestEvent);
 
+    if (this._disposed)
+      throw new TargetClosedError(this._closeReason || 'Request context disposed.');
+
     let destroyRequest: (() => void) | undefined;
     progress.setAllowConcurrentOrNestedRaces(true);
     const resultPromise = new Promise<SendRequestResult>((fulfill, reject) => {
@@ -327,6 +352,7 @@ export abstract class APIRequestContext extends SdkObject {
       const requestOptions = { ...options, agent };
 
       const startAt = monotonicTime();
+      const startAtWallTime = Date.now();
       let reusedSocketAt: number | undefined;
       let dnsLookupAt: number | undefined;
       let tcpConnectionAt: number | undefined;
@@ -356,6 +382,19 @@ export abstract class APIRequestContext extends SdkObject {
             blocked: reusedSocketAt ? reusedSocketAt - startAt : -1,
           };
 
+          // spec: https://developer.mozilla.org/en-US/docs/Web/API/PerformanceResourceTiming
+          const requestStartAt = connectEnd ?? reusedSocketAt;
+          const resourceTiming: channels.ResourceTiming = {
+            startTime: startAtWallTime,
+            domainLookupStart: dnsLookupAt ? 0 : -1,
+            domainLookupEnd: dnsLookupAt ? dnsLookupAt - startAt : -1,
+            connectStart: tcpConnectionAt ? (dnsLookupAt ?? startAt) - startAt : -1,
+            secureConnectionStart: tlsHandshakeAt && tcpConnectionAt ? tcpConnectionAt - startAt : -1,
+            connectEnd: connectEnd ? connectEnd - startAt : -1,
+            requestStart: requestStartAt ? requestStartAt - startAt : -1,
+            responseStart: responseAt - startAt,
+          };
+
           const requestFinishedEvent: APIRequestFinishedEvent = {
             requestEvent,
             httpVersion: response.httpVersion,
@@ -371,10 +410,11 @@ export abstract class APIRequestContext extends SdkObject {
             securityDetails,
           };
           this.emit(APIRequestContext.Events.RequestFinished, requestFinishedEvent);
+          return { resourceTiming, responseEndTiming: endAt - startAt };
         };
-        progress.log(`← ${response.statusCode} ${response.statusMessage}`);
+        fetchLog(`← ${response.statusCode} ${response.statusMessage}`);
         for (const [name, value] of Object.entries(response.headers))
-          progress.log(`  ${name}: ${value}`);
+          fetchLog(`  ${name}: ${value}`);
 
         const cookies = this._parseSetCookieHeader(response.url || url.toString(), response.headers['set-cookie']) ;
         if (cookies.length) {
@@ -436,8 +476,7 @@ export abstract class APIRequestContext extends SdkObject {
               return;
             }
 
-            if (headers['host'])
-              headers['host'] = locationURL.host;
+            setHeader(headers, 'host', locationURL.host);
 
             // Drop credentials scoped to the original origin on cross-origin redirects.
             if (locationURL.origin !== url.origin)
@@ -449,7 +488,7 @@ export abstract class APIRequestContext extends SdkObject {
                 getMatchingTLSOptionsForOrigin(this._defaultOptions().clientCertificates, locationURL.origin));
 
             notifyRequestFinished();
-            fulfill(this._sendRequest(progress, locationURL, redirectOptions, postData));
+            fulfill(this._sendRequest(progress, log, locationURL, redirectOptions, postData));
             request.destroy();
             return;
           }
@@ -460,29 +499,34 @@ export abstract class APIRequestContext extends SdkObject {
           if (auth?.trim().startsWith('Basic') && credentials) {
             setBasicAuthorizationHeader(options.headers, credentials);
             notifyRequestFinished();
-            fulfill(this._sendRequest(progress, url, options, postData));
+            fulfill(this._sendRequest(progress, log, url, options, postData));
             request.destroy();
             return;
           }
         }
-        response.on('aborted', () => reject(new Error('aborted')));
-
         const chunks: Buffer[] = [];
         const notifyBodyFinished = () => {
           const body = Buffer.concat(chunks);
-          notifyRequestFinished(body);
+          const { resourceTiming, responseEndTiming } = notifyRequestFinished(body);
           fulfill({
-            url: response.url || url.toString(),
-            status: response.statusCode || 0,
-            statusText: response.statusMessage || '',
-            headers: toHeadersArray(response.rawHeaders),
-            body
+            body,
+            log,
+            response: {
+              url: response.url || url.toString(),
+              status: response.statusCode || 0,
+              statusText: response.statusMessage || '',
+              headers: toHeadersArray(response.rawHeaders),
+              securityDetails,
+              serverAddr: serverIPAddress !== undefined && serverPort !== undefined ? { ipAddress: serverIPAddress, port: serverPort } : undefined,
+              timing: resourceTiming,
+              responseEndTiming,
+            },
           });
         };
 
         let body: Readable = response;
         let transform: Transform | undefined;
-        const encoding = response.headers['content-encoding'];
+        const encoding = response.headers['content-encoding']?.toLowerCase();
         if (encoding === 'gzip' || encoding === 'x-gzip') {
           transform = zlib.createGunzip({
             flush: zlib.constants.Z_SYNC_FLUSH,
@@ -500,11 +544,21 @@ export abstract class APIRequestContext extends SdkObject {
           // Brotli and deflate decompressors throw if the input stream is empty.
           const emptyStreamTransform = new SafeEmptyStreamTransform(notifyBodyFinished);
           body = pipeline(response, emptyStreamTransform, transform, e => {
-            if (e)
-              reject(new Error(`failed to decompress '${encoding}' encoding: ${e.message}`));
+            if (e) {
+              if (isNetworkConnectionError(e))
+                reject(e);
+              else
+                reject(new Error(`failed to decompress '${encoding}' encoding: ${e.message}`));
+            }
           });
-          body.on('error', e => reject(new Error(`failed to decompress '${encoding}' encoding: ${e}`)));
+          body.on('error', e => {
+            if (isNetworkConnectionError(e))
+              reject(e);
+            else
+              reject(new Error(`failed to decompress '${encoding}' encoding: ${e}`));
+          });
         } else {
+          response.on('aborted', () => reject(new Error('aborted')));
           body.on('error', reject);
         }
 
@@ -516,15 +570,34 @@ export abstract class APIRequestContext extends SdkObject {
 
       listeners.push(
           eventsHelper.addEventListener(this, APIRequestContext.Events.Dispose, () => {
-            reject(new Error('Request context disposed.'));
+            reject(new TargetClosedError(this._closeReason || 'Request context disposed.'));
             request.destroy();
           })
       );
       request.on('close', () => eventsHelper.removeEventListeners(listeners));
 
+      const captureSecurityDetails = (socket: net.Socket) => {
+        if (!(socket instanceof TLSSocket))
+          return;
+        const peerCertificate = socket.getPeerCertificate();
+        // Multi-value RDNs are reported as string arrays, take the first common name.
+        const commonName = (field: string | string[] | undefined) => Array.isArray(field) ? field[0] : field;
+        securityDetails = {
+          protocol: socket.getProtocol() ?? undefined,
+          subjectName: commonName(peerCertificate.subject?.CN),
+          validFrom: new Date(peerCertificate.valid_from).getTime() / 1000,
+          validTo: new Date(peerCertificate.valid_to).getTime() / 1000,
+          issuer: commonName(peerCertificate.issuer?.CN)
+        };
+      };
+
       request.on('socket', socket => {
+        serverIPAddress = socket.remoteAddress;
+        serverPort = socket.remotePort;
+
         if (request.reusedSocket) {
           reusedSocketAt = monotonicTime();
+          captureSecurityDetails(socket);
           return;
         }
 
@@ -539,29 +612,16 @@ export abstract class APIRequestContext extends SdkObject {
             eventsHelper.addEventListener(socket, 'connect', () => { tcpConnectionAt = monotonicTime(); }),
             eventsHelper.addEventListener(socket, 'secureConnect', () => {
               tlsHandshakeAt = monotonicTime();
-
-              if (socket instanceof TLSSocket) {
-                const peerCertificate = socket.getPeerCertificate();
-                securityDetails = {
-                  protocol: socket.getProtocol() ?? undefined,
-                  subjectName: peerCertificate.subject.CN,
-                  validFrom: new Date(peerCertificate.valid_from).getTime() / 1000,
-                  validTo: new Date(peerCertificate.valid_to).getTime() / 1000,
-                  issuer: peerCertificate.issuer.CN
-                };
-              }
+              captureSecurityDetails(socket);
             }),
         );
-
-        serverIPAddress = socket.remoteAddress;
-        serverPort = socket.remotePort;
       });
       request.on('finish', () => { requestFinishAt = monotonicTime(); });
 
-      progress.log(`→ ${options.method} ${url.toString()}`);
+      fetchLog(`→ ${options.method} ${url.toString()}`);
       if (options.headers) {
         for (const [name, value] of Object.entries(options.headers))
-          progress.log(`  ${name}: ${value}`);
+          fetchLog(`  ${name}: ${value}`);
       }
 
       if (postData)
@@ -646,6 +706,114 @@ export class BrowserContextAPIRequestContext extends APIRequestContext {
   override async storageState(progress: Progress, indexedDB?: boolean): Promise<channels.APIRequestContextStorageStateResult> {
     return this._context.storageState(progress, indexedDB);
   }
+
+  protected override async _lookupInHar(progress: Progress, url: URL, method: string, headers: HeadersObject, postData: Buffer | undefined, maxRedirects: number): Promise<SendRequestResult | undefined> {
+    const registrations = this._context.harForAPIRequests();
+    if (!registrations.length)
+      return undefined;
+
+    const log: string[] = [];
+    const fetchLog = (message: string) => {
+      log.push(message);
+      progress.log(message);
+    };
+
+    await this._updateRequestCookieHeader(progress, url, headers);
+
+    const urlString = url.toString();
+    fetchLog(`→ ${method} ${urlString}`);
+    const headersArray: HeadersArray = Object.entries(headers).map(([name, value]) => ({ name, value }));
+    for (const registration of [...registrations]) {
+      if (!urlMatches(registration.baseURL, urlString, registration.urlMatch))
+        continue;
+      const lookupResult = await progress.race(registration.harBackend.lookup(urlString, method, headersArray, postData, false, { apiRequestOnly: true, maxRedirects }));
+      if (lookupResult.action === 'error') {
+        const message = lookupResult.message ? ` :${lookupResult.message}` : '';
+        fetchLog(`HAR: lookup failed${message}`);
+        if (registration.notFound === 'abort')
+          throw new Error(`Request "${method} ${urlString}" failed to lookup in the HAR file${message}`);
+        continue;
+      }
+
+      if (lookupResult.action === 'noentry') {
+        fetchLog(`HAR: no entry found`);
+        if (registration.notFound === 'abort')
+          throw new Error(`Request "${method} ${urlString}" was not found in the HAR file`);
+        continue;
+      }
+
+      const finalUrl = lookupResult.url ?? urlString;
+      const status = lookupResult.status ?? 0;
+      const statusText = lookupResult.statusText ?? '';
+      const responseHeaders = lookupResult.headers ?? [];
+      const body = lookupResult.body ?? Buffer.from('');
+      fetchLog(`← ${status} ${statusText} (from HAR)`);
+      for (const { name, value } of responseHeaders)
+        fetchLog(`  ${name}: ${value}`);
+
+      // Emit Request/RequestFinished here (not before the loop) so that we do not double-emit
+      // when there is no match and we fall through to the live request path, which emits them too.
+      const requestCookies = getHeader(headers, 'cookie')?.split(';').map(p => {
+        const indexOfEquals = p.indexOf('=');
+        const name = indexOfEquals !== -1 ? p.substring(0, indexOfEquals).trim() : p.trim();
+        const value = indexOfEquals !== -1 ? p.substring(indexOfEquals + 1).trim() : '';
+        return { name, value };
+      }) || [];
+      const requestEvent: APIRequestEvent = {
+        url,
+        method,
+        headers,
+        cookies: requestCookies,
+        postData,
+      };
+      this.emit(APIRequestContext.Events.Request, requestEvent);
+
+      const setCookie = responseHeaders.filter(h => h.name.toLowerCase() === 'set-cookie').map(h => h.value);
+      const cookies = this._parseSetCookieHeader(finalUrl, setCookie);
+      if (cookies.length) {
+        try {
+          await progress.race(this.addCookies(cookies));
+        } catch (e) {
+          // Cookie value is limited by 4096 characters in the browsers. If setCookies failed,
+          // we try setting each cookie individually just in case only some of them are bad.
+          await progress.race(Promise.all(cookies.map(c => this.addCookies([c]).catch(() => {}))));
+        }
+      }
+
+      const serverAddr = lookupResult.serverIPAddress !== undefined && lookupResult.serverPort !== undefined ?
+        { ipAddress: lookupResult.serverIPAddress, port: lookupResult.serverPort } : undefined;
+
+      const requestFinishedEvent: APIRequestFinishedEvent = {
+        requestEvent,
+        httpVersion: lookupResult.httpVersion ?? 'HTTP/1.1',
+        statusCode: status,
+        statusMessage: statusText,
+        headers: toHeadersObject(responseHeaders),
+        rawHeaders: responseHeaders.flatMap(({ name, value }) => [name, value]),
+        cookies,
+        body,
+        timings: lookupResult.timings ?? { send: -1, wait: -1, receive: -1 },
+        serverIPAddress: lookupResult.serverIPAddress,
+        serverPort: lookupResult.serverPort,
+        securityDetails: lookupResult.securityDetails,
+      };
+      this.emit(APIRequestContext.Events.RequestFinished, requestFinishedEvent);
+
+      return {
+        body,
+        log,
+        response: {
+          url: finalUrl,
+          status,
+          statusText,
+          headers: responseHeaders,
+          securityDetails: lookupResult.securityDetails,
+          serverAddr,
+        },
+      };
+    }
+    return undefined;
+  }
 }
 
 
@@ -715,6 +883,25 @@ function toHeadersArray(rawHeaders: string[]): types.HeadersArray {
   return result;
 }
 
+function toHeadersObject(headers: types.HeadersArray): http.IncomingHttpHeaders {
+  const result: http.IncomingHttpHeaders = {};
+  for (const { name, value } of headers) {
+    const key = name.toLowerCase();
+    // set-cookie is the only multi-valued header Node exposes as an array.
+    if (key === 'set-cookie') {
+      const existing = result['set-cookie'];
+      if (existing)
+        existing.push(value);
+      else
+        result['set-cookie'] = [value];
+    } else {
+      const existing = result[key];
+      result[key] = existing ? `${existing}, ${value}` : value;
+    }
+  }
+  return result;
+}
+
 const redirectStatus = [301, 302, 303, 307, 308];
 
 function parseCookie(header: string): channels.NetworkCookie | null {
@@ -751,7 +938,7 @@ function serializePostData(params: channels.APIRequestContextFetchParams, header
     for (const field of params.multipartData) {
       if (field.file)
         formData.addFileField(field.name, field.file);
-      else if (field.value)
+      else if (field.value !== undefined)
         formData.addField(field.name, field.value);
     }
     setHeader(headers, 'content-type', formData.contentTypeHeader(), true);
@@ -780,6 +967,11 @@ function removeHeader(headers: { [name: string]: string }, name: string) {
   const existing = Object.entries(headers).find(pair => pair[0].toLowerCase() === name.toLowerCase());
   if (existing)
     delete headers[existing[0]];
+}
+
+function isNetworkConnectionError(e: any): boolean {
+  const code = e?.code;
+  return code === 'ECONNRESET' || code === 'EPIPE' || code === 'ECONNABORTED';
 }
 
 function setBasicAuthorizationHeader(headers: { [name: string]: string }, credentials: HTTPCredentials) {

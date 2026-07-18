@@ -26,8 +26,8 @@ import type { Response, Route } from '../network';
 import type { BrowserContextDispatcher } from './browserContextDispatcher';
 import type { RootDispatcher } from './dispatcher';
 import type { PageDispatcher } from './pageDispatcher';
-import type * as channels from '@protocol/channels';
-import type { Progress } from '@protocol/progress';
+import type * as channels from '../channels';
+import type { Progress } from '../progress';
 
 export class RequestDispatcher extends Dispatcher<Request, channels.RequestChannel, BrowserContextDispatcher | PageDispatcher | FrameDispatcher> implements channels.RequestChannel {
   _type_Request: boolean;
@@ -175,7 +175,6 @@ export class RouteDispatcher extends Dispatcher<Route, channels.RouteChannel, Re
 }
 
 export class WebSocketDispatcher extends Dispatcher<WebSocket, channels.WebSocketChannel, PageDispatcher> implements channels.WebSocketChannel {
-  _type_EventTarget = true;
   _type_WebSocket = true;
 
   constructor(scope: PageDispatcher, webSocket: WebSocket) {
@@ -217,7 +216,6 @@ export class APIRequestContextDispatcher extends Dispatcher<APIRequestContext, c
   }
 
   async dispose(params: channels.APIRequestContextDisposeParams, progress: Progress): Promise<void> {
-    progress.metadata.potentiallyClosesScope = true;
     await progress.race(this._object.dispose(params));
     this._dispose();
   }

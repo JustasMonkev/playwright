@@ -15,8 +15,6 @@
 Worker:
   type: interface
 
-  extends: EventTarget
-
   initializer:
     url: string
 
@@ -26,8 +24,6 @@ Worker:
       title: Disconnect from worker
       parameters:
         reason: string?
-      flags:
-        pausesBeforeAction: true
 
     evaluateExpression:
       title: Evaluate

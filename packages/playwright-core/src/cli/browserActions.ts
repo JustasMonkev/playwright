@@ -85,9 +85,6 @@ async function launchContext(options: Options, extraOptions: LaunchOptions): Pro
     delete contextOptions.isMobile;
   }
 
-  if (contextOptions.isMobile && browserType.name() === 'firefox')
-    contextOptions.isMobile = undefined;
-
   if (options.blockServiceWorkers)
     contextOptions.serviceWorkers = 'block';
 
@@ -247,7 +244,7 @@ export async function codegen(options: Options & { target: string, output?: stri
   });
   const donePromise = new ManualPromise<void>();
   maybeSetupTestHooks(browser, closeBrowser, donePromise);
-  dotenv.config({ path: 'playwright.env' });
+  dotenv.config({ path: 'playwright.env', quiet: true });
   await context._enableRecorder({
     language,
     launchOptions,

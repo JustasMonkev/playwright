@@ -22,8 +22,8 @@ import { SdkObject } from '../instrumentation';
 
 import type { RootDispatcher } from './dispatcher';
 import type { Android, SocketBackend } from '../android/android';
-import type * as channels from '@protocol/channels';
-import type { Progress } from '@protocol/progress';
+import type * as channels from '../channels';
+import type { Progress } from '../progress';
 
 export class AndroidDispatcher extends Dispatcher<Android, channels.AndroidChannel, RootDispatcher> implements channels.AndroidChannel {
   _type_Android = true;
@@ -44,7 +44,6 @@ export class AndroidDispatcher extends Dispatcher<Android, channels.AndroidChann
 }
 
 export class AndroidDeviceDispatcher extends Dispatcher<AndroidDevice, channels.AndroidDeviceChannel, AndroidDispatcher> implements channels.AndroidDeviceChannel {
-  _type_EventTarget = true;
   _type_AndroidDevice = true;
 
   static from(scope: AndroidDispatcher, device: AndroidDevice): AndroidDeviceDispatcher {
@@ -105,7 +104,7 @@ export class AndroidDeviceDispatcher extends Dispatcher<AndroidDevice, channels.
     await this._object.send(progress, 'swipe', params);
   }
 
-  async info(params: channels.AndroidDeviceTapParams, progress: Progress): Promise<channels.AndroidDeviceInfoResult> {
+  async info(params: channels.AndroidDeviceInfoParams, progress: Progress): Promise<channels.AndroidDeviceInfoResult> {
     const info = await this._object.send(progress, 'info', params);
     fixupAndroidElementInfo(info);
     return { info };

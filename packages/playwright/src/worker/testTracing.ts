@@ -24,12 +24,11 @@ import { monotonicTime } from '@isomorphic/time';
 import { calculateSha1, createGuid } from '@utils/crypto';
 import { SerializedFS } from '@utils/serializedFS';
 import { getPlaywrightVersion } from 'playwright-core/lib/coreBundle';
-
-import { filteredStackTrace } from '../util';
+import { filteredStackTrace } from '@utils/stackTrace';
 
 import type { TestStepCategory, TestInfoImpl } from './testInfo';
 import type { PlaywrightWorkerOptions, TestInfo, TestInfoError, TraceMode } from '../../types/test';
-import type { SerializedError, StackFrame } from '@protocol/channels';
+import type { StackFrame } from '@utils/stackTrace';
 import type * as trace from '@trace/trace';
 import type EventEmitter from 'events';
 
@@ -238,9 +237,9 @@ export class TestTracing {
     const traceContent = Buffer.from(this._traceEvents.map(e => JSON.stringify(e)).join('\n'));
     zipFile.addBuffer(traceContent, testTraceEntryName);
 
-    await new Promise(f => {
+    await new Promise<void>((resolve, reject) => {
       zipFile.end(undefined, () => {
-        zipFile.outputStream.pipe(fs.createWriteStream(this._generateNextTraceRecordingPath())).on('close', f);
+        zipFile.outputStream.pipe(fs.createWriteStream(this._generateNextTraceRecordingPath())).on('close', resolve).on('error', reject);
       });
     });
 
@@ -291,7 +290,7 @@ export class TestTracing {
     });
   }
 
-  appendAfterActionForStep(callId: string, error?: SerializedError['error'], attachments: Attachment[] = [], annotations?: trace.AfterActionTraceEventAnnotation[]) {
+  appendAfterActionForStep(callId: string, error?: trace.SerializedError['error'], attachments: Attachment[] = [], annotations?: trace.AfterActionTraceEventAnnotation[]) {
     this._appendTraceEvent({
       type: 'after',
       callId,

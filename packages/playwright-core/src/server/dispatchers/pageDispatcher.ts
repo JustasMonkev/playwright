@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import { renderTitleForCall } from '@isomorphic/protocolFormatter';
 import { deserializeURLMatch, urlMatches } from '@isomorphic/urlMatch';
 import { Page, Worker } from '../page';
 import { Dispatcher } from './dispatcher';
@@ -45,14 +46,13 @@ import type { InitScript } from '../page';
 import type { Disposable } from '../disposable';
 import type { BrowserTypeDispatcher } from './browserTypeDispatcher';
 import type { ConsoleMessage } from '../console';
-import type * as channels from '@protocol/channels';
-import type { Progress } from '@protocol/progress';
+import type * as channels from '../channels';
+import type { Progress } from '../progress';
 import type { URLMatch } from '@isomorphic/urlMatch';
 import type { ScreencastFrame } from '../types';
 import type { ScreencastClient } from '../screencast';
 
 export class PageDispatcher extends Dispatcher<Page, channels.PageChannel, BrowserContextDispatcher> implements channels.PageChannel {
-  _type_EventTarget = true;
   _type_Page = true;
   private _page: Page;
   _subscriptions = new Set<channels.PageUpdateSubscriptionParams['event']>();
@@ -143,7 +143,7 @@ export class PageDispatcher extends Dispatcher<Page, channels.PageChannel, Brows
       const binding = new BindingCallDispatcher(this, params.name, source, args);
       this._dispatchEvent('bindingCall', { binding });
       return binding.promise();
-    });
+    }, params.noGlobal);
     this._disposables.push(binding);
     return { disposable: new DisposableDispatcher(this, binding) };
   }
@@ -233,6 +233,7 @@ export class PageDispatcher extends Dispatcher<Page, channels.PageChannel, Brows
       frame: (params.locator.frame as FrameDispatcher)._object,
       selector: params.locator.selector,
     } : undefined;
+    progress.log(`${renderTitleForCall(progress.metadata)}${progress.timeout ? ` with timeout ${progress.timeout}ms` : ''}`);
     return await this._page.expectScreenshot(progress, {
       ...params,
       locator,
@@ -249,9 +250,11 @@ export class PageDispatcher extends Dispatcher<Page, channels.PageChannel, Brows
   }
 
   async close(params: channels.PageCloseParams, progress: Progress): Promise<void> {
-    if (!params.runBeforeUnload)
-      progress.metadata.potentiallyClosesScope = true;
     await this._page.close(progress, params);
+  }
+
+  async runBeforeUnload(params: channels.PageRunBeforeUnloadParams, progress: Progress): Promise<void> {
+    await this._page.runBeforeUnload(progress);
   }
 
   async updateSubscription(params: channels.PageUpdateSubscriptionParams, progress: Progress): Promise<void> {
@@ -325,7 +328,6 @@ export class PageDispatcher extends Dispatcher<Page, channels.PageChannel, Brows
   }
 
   async touchscreenTap(params: channels.PageTouchscreenTapParams, progress: Progress): Promise<void> {
-    progress.metadata.point = { x: params.x, y: params.y };
     await this._page.touchscreen.apiTap(progress, params.x, params.y);
   }
 
@@ -382,7 +384,7 @@ export class PageDispatcher extends Dispatcher<Page, channels.PageChannel, Brows
   }
 
   async screencastShowActions(params: channels.PageScreencastShowActionsParams): Promise<channels.PageScreencastShowActionsResult> {
-    this._page.screencast.showActions({ duration: params.duration, position: params.position, fontSize: params.fontSize });
+    this._page.screencast.showActions({ duration: params.duration, position: params.position, fontSize: params.fontSize, cursor: params.cursor });
   }
 
   async screencastHideActions(): Promise<channels.PageScreencastHideActionsResult> {
@@ -396,7 +398,7 @@ export class PageDispatcher extends Dispatcher<Page, channels.PageChannel, Brows
     if (params.sendFrames) {
       this._screencastClient = {
         onFrame: (frame: ScreencastFrame) => {
-          this._dispatchEvent('screencastFrame', { data: frame.buffer, viewportWidth: frame.viewportWidth, viewportHeight: frame.viewportHeight });
+          this._dispatchEvent('screencastFrame', { data: frame.buffer, timestamp: frame.frameSwapWallTime, viewportWidth: frame.viewportWidth, viewportHeight: frame.viewportHeight });
         },
         dispose: () => {},
         size: params.size,
@@ -485,12 +487,31 @@ export class PageDispatcher extends Dispatcher<Page, channels.PageChannel, Brows
   async setDockTile(params: channels.PageSetDockTileParams): Promise<void> {
     await this._page.setDockTile(params.image);
   }
+
+  async webStorageItems(params: channels.PageWebStorageItemsParams, progress: Progress): Promise<channels.PageWebStorageItemsResult> {
+    return { items: await this._page.webStorageItems(progress, params.kind) };
+  }
+
+  async webStorageGetItem(params: channels.PageWebStorageGetItemParams, progress: Progress): Promise<channels.PageWebStorageGetItemResult> {
+    return { value: await this._page.webStorageGetItem(progress, params.kind, params.name) };
+  }
+
+  async webStorageSetItem(params: channels.PageWebStorageSetItemParams, progress: Progress): Promise<void> {
+    await this._page.webStorageSetItem(progress, params.kind, params.name, params.value);
+  }
+
+  async webStorageRemoveItem(params: channels.PageWebStorageRemoveItemParams, progress: Progress): Promise<void> {
+    await this._page.webStorageRemoveItem(progress, params.kind, params.name);
+  }
+
+  async webStorageClear(params: channels.PageWebStorageClearParams, progress: Progress): Promise<void> {
+    await this._page.webStorageClear(progress, params.kind);
+  }
 }
 
 
 export class WorkerDispatcher extends Dispatcher<Worker, channels.WorkerChannel, PageDispatcher | BrowserContextDispatcher | BrowserTypeDispatcher> implements channels.WorkerChannel {
   _type_Worker = true;
-  _type_EventTarget = true;
 
   readonly _subscriptions = new Set<channels.WorkerUpdateSubscriptionParams['event']>();
 
@@ -516,11 +537,13 @@ export class WorkerDispatcher extends Dispatcher<Worker, channels.WorkerChannel,
         timestamp: message.timestamp(),
       });
     });
-    this.addObjectListener(Worker.Events.Close, () => this._dispatchEvent('close'));
+    this.addObjectListener(Worker.Events.Close, () => {
+      this._dispatchEvent('close');
+      this._dispose();
+    });
   }
 
   async disconnect(params: channels.WorkerDisconnectParams, progress: Progress): Promise<void> {
-    progress.metadata.potentiallyClosesScope = true;
     await this._object.disconnect(progress, params);
   }
 

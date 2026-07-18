@@ -20,6 +20,7 @@ import { BidiChromium } from './bidi/bidiChromium';
 import { BidiFirefox } from './bidi/bidiFirefox';
 import { Chromium } from './chromium/chromium';
 import { DebugController } from './debugController';
+import { Electron } from './electron/electron';
 import { Firefox } from './firefox/firefox';
 import { SdkObject, createRootSdkObject } from './instrumentation';
 import { WebKit } from './webkit/webkit';
@@ -33,11 +34,13 @@ type PlaywrightOptions = {
   sdkLanguage: Language;
   isInternalPlaywright?: boolean;
   isServer?: boolean;
+  isClientCollocatedWithServer?: boolean;
 };
 
 export class Playwright extends SdkObject {
   readonly chromium: BrowserType;
   readonly android: Android;
+  readonly electron: Electron;
   readonly firefox: BrowserType;
   readonly webkit: BrowserType;
   readonly options: PlaywrightOptions;
@@ -58,6 +61,7 @@ export class Playwright extends SdkObject {
     this.chromium = new Chromium(this, new BidiChromium(this));
     this.firefox = new Firefox(this, new BidiFirefox(this));
     this.webkit = new WebKit(this);
+    this.electron = new Electron(this);
     this.android = new Android(this, new AdbBackend());
     this.debugController = new DebugController(this);
   }

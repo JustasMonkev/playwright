@@ -157,11 +157,13 @@ class HtmlReporter implements ReporterV2 {
     const noSnippets = parseBooleanEnvVar('PLAYWRIGHT_HTML_NO_SNIPPETS') ?? this._options.noSnippets;
     const noCopyPrompt = parseBooleanEnvVar('PLAYWRIGHT_HTML_NO_COPY_PROMPT') ?? this._options.noCopyPrompt;
     const doNotInlineAssets = parseBooleanEnvVar('PLAYWRIGHT_HTML_DO_NOT_INLINE_ASSETS') ?? this._options.doNotInlineAssets ?? false;
+    const mergeFiles = parseBooleanEnvVar('PLAYWRIGHT_HTML_MERGE_FILES') ?? this._options.mergeFiles;
 
     const builder = new HtmlBuilder(yazl, this.config, this._outputFolder, this._attachmentsBaseURL, doNotInlineAssets, {
       title: process.env.PLAYWRIGHT_HTML_TITLE || this._options.title,
       noSnippets,
       noCopyPrompt,
+      mergeFiles,
     });
     this._buildResult = await builder.build(this.config.metadata, projectSuites, result, this._topLevelErrors, this._machines);
   }
@@ -289,7 +291,7 @@ export async function showHTMLReport(reportFolder: string | undefined, host: str
 // the generated index.html; we extract it and splice it into Vite's
 // transformed HTML so the client still finds it at runtime.
 async function serveHtmlReportWithHMR(folder: string): Promise<HttpServer> {
-  const server = new HttpServer();
+  const server = new HttpServer(folder);
   const reporterRoot = path.resolve(__dirname, '..', '..', '..', 'html-reporter');
   const devServer = await server.createViteDevServer({ root: reporterRoot });
   const generatedIndex = await fs.promises.readFile(path.join(folder, 'index.html'), 'utf-8');
@@ -314,7 +316,7 @@ async function serveHtmlReportWithHMR(folder: string): Promise<HttpServer> {
     // Serve attachments and the bundled trace-viewer copy from the generated
     // output folder first, falling through to Vite for source modules.
     const absolutePath = path.join(folder, ...url.pathname.split('/'));
-    if (absolutePath.startsWith(folder) && server.serveFile(request, response, absolutePath))
+    if (server.serveFile(request, response, absolutePath))
       return true;
     devServer.middlewares(request, response, HttpServer.notFoundFallback(response));
     return true;
@@ -464,11 +466,11 @@ class HtmlBuilder {
 
   private async _writeReportData(filePath: string) {
     fs.appendFileSync(filePath, '<template id="playwrightReportBase64">data:application/zip;base64,');
-    await new Promise(f => {
+    await new Promise<void>((resolve, reject) => {
       this._dataZipFile.end(undefined, () => {
         this._dataZipFile.outputStream
             .pipe(new Base64Encoder())
-            .pipe(fs.createWriteStream(filePath, { flags: 'a' })).on('close', f);
+            .pipe(fs.createWriteStream(filePath, { flags: 'a' })).on('close', resolve).on('error', reject);
       });
     });
     fs.appendFileSync(filePath, '</template>');

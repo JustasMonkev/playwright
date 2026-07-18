@@ -21,8 +21,8 @@ import { Dispatcher } from './dispatcher';
 
 import type { BrowserType } from '../browserType';
 import type { RootDispatcher } from './dispatcher';
-import type * as channels from '@protocol/channels';
-import type { Progress } from '@protocol/progress';
+import type * as channels from '../channels';
+import type { Progress } from '../progress';
 
 export class BrowserTypeDispatcher extends Dispatcher<BrowserType, channels.BrowserTypeChannel, RootDispatcher> implements channels.BrowserTypeChannel {
   _type_BrowserType = true;
@@ -57,7 +57,7 @@ export class BrowserTypeDispatcher extends Dispatcher<BrowserType, channels.Brow
     if (this._denyLaunch)
       throw new Error(`Launching more browsers is not allowed.`);
 
-    const browser = await this._object.connectOverCDP(progress, params.endpointURL, params);
+    const browser = await this._object.connectOverCDP(progress, params);
     const browserDispatcher = new BrowserDispatcher(this, browser);
     return {
       browser: browserDispatcher,

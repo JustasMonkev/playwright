@@ -18,6 +18,7 @@ import { attachFrame, detachFrame } from '../config/utils';
 import { contextTest as test, expect } from '../config/browserTest';
 import type { Frame, Page, WebSocketRoute } from '@playwright/test';
 import { TestServer } from '../config/testserver';
+import type { WebSocket as WebSocketServer } from 'ws';
 
 declare global {
   interface Window {
@@ -243,6 +244,72 @@ test('should work with ws.close', async ({ page, server }) => {
     'close code=3009 reason=oops wasClean=true',
   ]);
   expect(await closedPromise).toEqual({ code: 3009, reason: 'oops' });
+});
+
+test('should observe upstream handshake failure when connectToServer is used', async ({ page, server }) => {
+  // Exercises the WebSocket-as-network-request path used by Firefox after the
+  // har-WebSocket plumbing change, where a 4xx handshake response is synthesized
+  // into a full lifecycle in FFPage._onWebSocketRequestFinished.
+  const serverCloses: { code: number | undefined, reason: string | undefined }[] = [];
+  let routeHandlerInvoked = 0;
+  await page.routeWebSocket(/.*/, ws => {
+    ++routeHandlerInvoked;
+    const serverRoute = ws.connectToServer();
+    serverRoute.onClose((code, reason) => {
+      serverCloses.push({ code, reason });
+      void ws.close();
+    });
+  });
+
+  const upgradePromise = server.waitForUpgrade();
+  await setupWS(page, server, 'blob');
+  const { socket } = await upgradePromise;
+  socket.write('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');
+  socket.destroy();
+
+  // Server-side route handler observes the close caused by the rejected handshake.
+  await expect.poll(() => serverCloses.length).toBe(1);
+  expect(serverCloses[0].code).toBeGreaterThanOrEqual(1000);
+
+  // Once the route closes the page-side socket, the page sees the close.
+  await expect.poll(() => page.evaluate(() => window.ws.readyState)).toBe(3);
+  expect(routeHandlerInvoked).toBe(1);
+});
+
+test('should observe multiple concurrent routed WebSockets with connectToServer', async ({ page, server }) => {
+  // Exercises FFNetworkManager._webSocketRequestIds tracking by routing two
+  // simultaneous WebSocket connections through `connectToServer()`. Each request
+  // gets a distinct id in the new Firefox WebSocket-as-network-request flow.
+  let routedConnections = 0;
+  await page.routeWebSocket(/.*/, ws => {
+    ++routedConnections;
+    const serverRoute = ws.connectToServer();
+    ws.onMessage(message => serverRoute.send(message));
+    serverRoute.onMessage(message => ws.send(message));
+  });
+
+  // Echo all incoming messages on whichever connection arrives; re-register after each.
+  const handleConnection = (ws: WebSocketServer) => {
+    ws.on('message', data => ws.send(`echo-${data.toString()}`));
+    server.onceWebSocketConnection(handleConnection);
+  };
+  server.onceWebSocketConnection(handleConnection);
+
+  await page.goto(server.EMPTY_PAGE);
+  const results = await page.evaluate(async host => {
+    const collect = (tag: string) => new Promise<string>(resolve => {
+      const ws = new WebSocket(`ws://${host}/ws`);
+      ws.addEventListener('open', () => ws.send(`hi-${tag}`));
+      ws.addEventListener('message', event => {
+        resolve(event.data);
+        ws.close();
+      });
+    });
+    return Promise.all([collect('a'), collect('b')]);
+  }, server.HOST);
+
+  expect(results.sort()).toEqual(['echo-hi-a', 'echo-hi-b']);
+  expect(routedConnections).toBe(2);
 });
 
 test('should pattern match', async ({ page, server }) => {
@@ -558,6 +625,30 @@ test('should work with no trailing slash', async ({ page, server }) => {
 
 test('should work with baseURL', async ({ contextFactory, server }) => {
   const context = await contextFactory({ baseURL: 'http://' + server.HOST });
+  const page = await context.newPage();
+
+  await page.routeWebSocket('/ws', ws => {
+    ws.onMessage(message => {
+      ws.send(message);
+    });
+  });
+
+  await setupWS(page, server, 'blob');
+
+  await page.evaluate(async () => {
+    await window.wsOpened;
+    window.ws.send('echo');
+  });
+
+  await expect.poll(() => page.evaluate(() => window.log)).toEqual([
+    'open',
+    `message: data=echo origin=ws://${server.HOST} lastEventId=`,
+  ]);
+});
+
+test('should work with baseURL regardless of scheme casing', async ({ contextFactory, server }) => {
+  // baseURL schemes are case-insensitive, same as everywhere else in URL matching.
+  const context = await contextFactory({ baseURL: 'HTTP://' + server.HOST });
   const page = await context.newPage();
 
   await page.routeWebSocket('/ws', ws => {

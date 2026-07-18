@@ -25,8 +25,8 @@ import { nullProgress } from '../progress';
 import type { BrowserTypeDispatcher } from './browserTypeDispatcher';
 import type { PageDispatcher } from './pageDispatcher';
 import type { CRBrowser } from '../chromium/crBrowser';
-import type * as channels from '@protocol/channels';
-import type { Progress } from '@protocol/progress';
+import type * as channels from '../channels';
+import type { Progress } from '../progress';
 
 type BrowserDispatcherOptions = {
   // Do not allow to close this browser.
@@ -96,14 +96,12 @@ export class BrowserDispatcher extends Dispatcher<Browser, channels.BrowserChann
   async close(params: channels.BrowserCloseParams, progress: Progress): Promise<void> {
     if (this._options.ignoreStopAndKill)
       return;
-    progress.metadata.potentiallyClosesScope = true;
     await this._object.close(progress, params);
   }
 
   async killForTests(params: channels.BrowserKillForTestsParams, progress: Progress): Promise<void> {
     if (this._options.ignoreStopAndKill)
       return;
-    progress.metadata.potentiallyClosesScope = true;
     await this._object.killForTests(progress);
   }
 

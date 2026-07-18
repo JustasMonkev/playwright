@@ -40,7 +40,6 @@ APIRequestContext:
         multipartData:
           type: array?
           items: FormField
-        timeout: float
         failOnStatusCode: boolean?
         ignoreHTTPSErrors: boolean?
         maxRedirects: int?
@@ -98,3 +97,7 @@ APIResponse:
     headers:
       type: array
       items: NameValue
+    securityDetails: SecurityDetails?
+    serverAddr: RemoteAddr?
+    timing: ResourceTiming?
+    responseEndTiming: float?

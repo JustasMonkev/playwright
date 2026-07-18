@@ -14,6 +14,10 @@
  * limitations under the License.
  */
 
+import { debugLogger } from '@utils/debugLogger';
+import { isRegExp, isString } from '@isomorphic/rtti';
+
+import { kNoTimeout } from './timeoutSettings';
 import type { BrowserContext } from './browserContext';
 import type { LocalUtils } from './localUtils';
 import type { Route } from './network';
@@ -27,6 +31,7 @@ export class HarRouter {
   private _harId: string;
   private _notFoundAction: HarNotFoundAction;
   private _options: { urlMatch?: URLMatch; baseURL?: string; };
+  private _apiRequestRegistrations: { context: BrowserContext, registrationId: string }[] = [];
 
   static async create(localUtils: LocalUtils, file: string, notFoundAction: HarNotFoundAction, options: { urlMatch?: URLMatch }): Promise<HarRouter> {
     const { harId, error } = await localUtils.harOpen({ file });
@@ -55,7 +60,7 @@ export class HarRouter {
     });
 
     if (response.action === 'redirect') {
-      route._platform.log('api', `HAR: ${route.request().url()} redirected to ${response.redirectURL}`);
+      debugLogger.log('api', `HAR: ${route.request().url()} redirected to ${response.redirectURL}`);
       await route._redirectNavigationRequest(response.redirectURL!);
       return;
     }
@@ -96,7 +101,7 @@ export class HarRouter {
     }
 
     if (response.action === 'error')
-      route._platform.log('api', 'HAR: ' + response.message!);
+      debugLogger.log('api', 'HAR: ' + response.message!);
     // Report the error, but fall through to the default handler.
 
     if (this._notFoundAction === 'abort') {
@@ -115,11 +120,26 @@ export class HarRouter {
     await page.route(this._options.urlMatch || '**/*', route => this._handle(route));
   }
 
+  async addAPIRequestRoute(context: BrowserContext) {
+    const urlMatch = this._options.urlMatch;
+    const { registrationId } = await context._channel.routeAPIRequestsFromHar({
+      harId: this._harId,
+      urlGlob: isString(urlMatch) ? urlMatch : undefined,
+      urlRegexSource: isRegExp(urlMatch) ? urlMatch.source : undefined,
+      urlRegexFlags: isRegExp(urlMatch) ? urlMatch.flags : undefined,
+      notFound: this._notFoundAction,
+    }, kNoTimeout);
+    this._apiRequestRegistrations.push({ context, registrationId });
+  }
+
   async [Symbol.asyncDispose]() {
     await this.dispose();
   }
 
   dispose() {
+    for (const { context, registrationId } of this._apiRequestRegistrations)
+      context._channel.unrouteAPIRequestsFromHar({ registrationId }, kNoTimeout).catch(() => {});
+    this._apiRequestRegistrations = [];
     this._localUtils.harClose({ harId: this._harId }).catch(() => {});
   }
 }

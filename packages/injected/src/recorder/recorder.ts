@@ -23,7 +23,7 @@ import type { AriaSnapshot } from '../ariaSnapshot';
 import type { Highlight, HighlightEntry } from '../highlight';
 import type { InjectedScript } from '../injectedScript';
 import type { ElementText } from '../selectorUtils';
-import type * as actions from '@recorder/actions';
+import type * as actions from '@isomorphic/codegen/actions';
 import type { ElementInfo, Mode, OverlayState, UIState } from '@recorder/recorderTypes';
 import type { Language } from '@isomorphic/locatorGenerators';
 
@@ -35,7 +35,7 @@ const HighlightColors = {
 };
 
 export interface RecorderDelegate {
-  performAction?(action: actions.PerformOnRecordAction): Promise<void>;
+  performAction?(action: actions.PerformOnRecordAction, preconditionSelector?: string): Promise<void>;
   recordAction?(action: actions.Action): Promise<void>;
   elementPicked?(elementInfo: ElementInfo): Promise<void>;
   setMode?(mode: Mode): Promise<void>;
@@ -412,9 +412,15 @@ class RecordActionTool implements RecorderTool {
     const target = this._recorder.deepEventTarget(event);
 
     if (target.nodeName === 'INPUT' && (target as HTMLInputElement).type.toLowerCase() === 'file') {
+      // When the file input is hidden and triggered by another element (e.g. a button with
+      // onclick="input.click()"), the hover model points to the trigger, not the input.
+      // Derive the selector from the actual target element in that case.
+      const selector = target === this._hoveredElement
+        ? this._hoveredModel!.selector
+        : this._recorder.injectedScript.generateSelector(target, { testIdAttributeName: this._recorder.state.testIdAttributeName }).selector;
       this._recordAction({
         name: 'setInputFiles',
-        selector: this._activeModel!.selector,
+        selector,
         signals: [],
         files: [...((target as HTMLInputElement).files || [])].map(file => file.name),
       });
@@ -614,13 +620,7 @@ class RecordActionTool implements RecorderTool {
   }
 
   private _shouldIgnoreMouseEvent(event: MouseEvent): boolean {
-    const target = this._recorder.deepEventTarget(event);
-    const nodeName = target.nodeName;
-    if (nodeName === 'SELECT' || nodeName === 'OPTION')
-      return true;
-    if (nodeName === 'INPUT' && ['date', 'range'].includes((target as HTMLInputElement).type))
-      return true;
-    return false;
+    return shouldIgnoreMouseEvent(this._recorder.deepEventTarget(event));
   }
 
   private _actionInProgress(event: Event): boolean {
@@ -891,13 +891,7 @@ class JsonRecordActionTool implements RecorderTool {
   }
 
   private _shouldIgnoreMouseEvent(event: MouseEvent): boolean {
-    const target = this._recorder.deepEventTarget(event);
-    const nodeName = target.nodeName;
-    if (nodeName === 'SELECT' || nodeName === 'OPTION')
-      return true;
-    if (nodeName === 'INPUT' && ['date', 'range'].includes((target as HTMLInputElement).type))
-      return true;
-    return false;
+    return shouldIgnoreMouseEvent(this._recorder.deepEventTarget(event));
   }
 
   private _shouldGenerateKeyPressFor(event: KeyboardEvent): boolean {
@@ -1704,13 +1698,14 @@ export class Recorder {
   async performAction(action: actions.PerformOnRecordAction) {
     const previousSnapshot = this._lastActionAutoexpectSnapshot;
     this._lastActionAutoexpectSnapshot = this._captureAutoExpectSnapshot();
+    let preconditionSelector: string | undefined;
     if (!isAssertAction(action) && this._lastActionAutoexpectSnapshot) {
       const element = this.injectedScript.utils.findNewElement(previousSnapshot?.root, this._lastActionAutoexpectSnapshot?.root);
-      action.preconditionSelector = element ? this.injectedScript.generateSelector(element, { testIdAttributeName: this.state.testIdAttributeName }).selector : undefined;
-      if (action.preconditionSelector === action.selector)
-        action.preconditionSelector = undefined;
+      preconditionSelector = element ? this.injectedScript.generateSelector(element, { testIdAttributeName: this.state.testIdAttributeName }).selector : undefined;
+      if (preconditionSelector === action.selector)
+        preconditionSelector = undefined;
     }
-    await this._delegate.performAction?.(action).catch(() => {});
+    await this._delegate.performAction?.(action, preconditionSelector).catch(() => {});
   }
 
   async recordAction(action: actions.Action) {
@@ -1884,6 +1879,18 @@ function isRangeInput(node: Node | null): node is HTMLInputElement {
     return false;
   const inputElement = node as HTMLInputElement;
   return inputElement.type.toLowerCase() === 'range';
+}
+
+// Non-text input types that open native pickers.
+const kNativePickerInputTypes = new Set(['color', 'date', 'datetime-local', 'file', 'month', 'range', 'time', 'week']);
+
+function shouldIgnoreMouseEvent(target: Node): boolean {
+  const nodeName = target.nodeName;
+  if (nodeName === 'SELECT' || nodeName === 'OPTION')
+    return true;
+  if (nodeName === 'INPUT' && kNativePickerInputTypes.has((target as HTMLInputElement).type))
+    return true;
+  return false;
 }
 
 function addEventListener(target: EventTarget, eventName: string, listener: EventListener, useCapture?: boolean): () => void {

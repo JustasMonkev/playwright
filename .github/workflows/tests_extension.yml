@@ -30,7 +30,6 @@ concurrency:
 
 env:
   FORCE_COLOR: 1
-  ELECTRON_SKIP_BINARY_DOWNLOAD: 1
   DEBUG: pw:mcp:error
 
 jobs:
@@ -50,3 +49,8 @@ jobs:
     - run: npm run build
     - run: npx playwright install --with-deps chromium
     - run: npm run test-extension
+    - name: Upload parquet report
+      if: ${{ !cancelled() }}
+      uses: ./.github/actions/upload-parquet-report
+      with:
+        job_name: extension-${{ matrix.os }}

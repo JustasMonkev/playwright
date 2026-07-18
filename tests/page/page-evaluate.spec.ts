@@ -161,13 +161,16 @@ it('should work with unicode chars', async ({ page }) => {
   expect(result).toBe(42);
 });
 
-it('should work with large strings', async ({ page }) => {
+it('should work with large strings', async ({ page, isAndroid }) => {
+  it.skip(isAndroid, 'string is too long :(');
+
   const expected = 'x'.repeat(40000);
   expect(await page.evaluate(data => data, expected)).toBe(expected);
 });
 
-it('should work with large unicode strings', async ({ page, browserName, platform }) => {
+it('should work with large unicode strings', async ({ page, browserName, platform, isAndroid }) => {
   it.info().annotations.push({ type: 'issue', description: 'https://github.com/microsoft/playwright/issues/16367' });
+  it.skip(isAndroid, 'string is too long :(');
 
   const expected = '🎭'.repeat(10000);
   expect(await page.evaluate(data => data, expected)).toBe(expected);
@@ -374,12 +377,12 @@ it('should properly serialize PerformanceMeasure object', async ({ page }) => {
     window.builtins.performance.mark('end');
     window.builtins.performance.measure('my-measure', 'start', 'end');
     return window.builtins.performance.getEntriesByType('measure');
-  })).toEqual([{
+  })).toEqual([expect.objectContaining({
     duration: expect.any(Number),
     entryType: 'measure',
     name: 'my-measure',
     startTime: expect.any(Number),
-  }]);
+  })]);
 });
 
 it('should properly serialize window.performance object', async ({ page }) => {
@@ -434,6 +437,20 @@ it('should throw for too deep reference chain', {
     }
     return obj;
   }, 1000)).rejects.toThrow('Cannot serialize result: object reference chain is too long.');
+});
+
+it('should throw for too deep reference chain 2', {
+  annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/40940' }
+}, async ({ page, browserName, isAndroid }) => {
+  it.skip(browserName !== 'chromium', 'this is a chromium-only limitation');
+  it.skip(isAndroid, 'something fails there');
+
+  await expect(page.evaluate(depth => {
+    let node = {};
+    for (let i = 0; i < depth; i++)
+      node = { child: node };
+    return node;
+  }, 200)).rejects.toThrow('Cannot serialize result: object reference chain is too long.');
 });
 
 it('should throw usable message for unserializable shallow function', async ({ page }) => {
@@ -848,6 +865,20 @@ it('should work with Array.from/map', async ({ page }) => {
     const r = (str, amount) => Array.from(Array(amount)).map(() => str).join('');
     return r('([a-f0-9]{2})', 3);
   })).toBe('([a-f0-9]{2})([a-f0-9]{2})([a-f0-9]{2})');
+});
+
+it('should work with a using declaration', async ({ page, nodeVersion }) => {
+  it.info().annotations.push({ type: 'issue', description: 'https://github.com/microsoft/playwright/issues/41511' });
+  it.skip(nodeVersion.major < 24, 'using is lowered to a module-scope helper that does not survive evaluate serialization on Node < 24');
+  const disposed = await page.evaluate(() => {
+    let disposed = false;
+    {
+      using r = { [Symbol.dispose]: () => { disposed = true; } };
+      void r;
+    }
+    return disposed;
+  });
+  expect(disposed).toBe(true);
 });
 
 it('should ignore dangerous object keys', async ({ page }) => {

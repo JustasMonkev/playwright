@@ -15,11 +15,12 @@
  */
 
 import path from 'path';
+import { Writable } from 'stream';
 
 import realColors from 'colors/safe';
 import { noColors } from '@isomorphic/colors';
 import { msToString } from '@isomorphic/formatUtils';
-import { parseErrorStack } from '@isomorphic/stackTrace';
+import { parseErrorStack } from '@utils/stackTrace';
 import { getPackageManagerExecCommand } from '@utils/env';
 import { fitToWidth } from '@utils/stringWidth';
 
@@ -77,6 +78,20 @@ const originalProcessStdout = process.stdout;
 // eslint-disable-next-line no-restricted-properties
 const originalProcessStderr = process.stderr;
 
+class StripAnsiStream extends Writable {
+  private _target: NodeJS.WriteStream;
+
+  constructor(target: NodeJS.WriteStream) {
+    super();
+    this._target = target;
+  }
+
+  override write(chunk: any, encodingOrCallback?: any, callback?: any): boolean {
+    const cb = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback;
+    return this._target.write(stripAnsiEscapes(chunk.toString()), cb);
+  }
+}
+
 // Output goes to terminal.
 export const terminalScreen: TerminalScreen = (() => {
   let isTTY = !!originalProcessStdout.isTTY;
@@ -108,7 +123,8 @@ export const terminalScreen: TerminalScreen = (() => {
 
   let useColors = isTTY;
   if (process.env.DEBUG_COLORS === '0' || process.env.DEBUG_COLORS === 'false' ||
-      process.env.FORCE_COLOR === '0' || process.env.FORCE_COLOR === 'false')
+      process.env.FORCE_COLOR === '0' || process.env.FORCE_COLOR === 'false' ||
+      (process.env.NO_COLOR !== undefined && process.env.NO_COLOR !== ''))
     useColors = false;
   else if (process.env.DEBUG_COLORS || process.env.FORCE_COLOR)
     useColors = true;
@@ -120,8 +136,8 @@ export const terminalScreen: TerminalScreen = (() => {
     ttyWidth,
     ttyHeight,
     colors,
-    stdout: originalProcessStdout,
-    stderr: originalProcessStderr,
+    stdout: useColors ? originalProcessStdout : new StripAnsiStream(originalProcessStdout) as unknown as NodeJS.WriteStream,
+    stderr: useColors ? originalProcessStderr : new StripAnsiStream(originalProcessStderr) as unknown as NodeJS.WriteStream,
   };
 })();
 
@@ -615,7 +631,7 @@ export function prepareErrorStack(stack: string): {
   stackLines: string[];
   location?: Location;
 } {
-  return parseErrorStack(stack, path.sep, !!process.env.PWDEBUGIMPL);
+  return parseErrorStack(stack);
 }
 
 function resolveFromEnv(name: string): string | undefined {

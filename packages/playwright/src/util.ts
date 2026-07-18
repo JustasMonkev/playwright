@@ -16,28 +16,22 @@
 
 import fs from 'fs';
 import path from 'path';
-import url from 'url';
 import util from 'util';
 
 import debug from 'debug';
 import mime from 'mime';
-import minimatch from 'minimatch';
+import { minimatch } from 'minimatch';
 import { calculateSha1 } from '@utils/crypto';
 import { sanitizeForFilePath } from '@utils/fileUtils';
 import { isRegExp } from '@isomorphic/rtti';
-import { parseStackFrame, stringifyStackFrames } from '@isomorphic/stackTrace';
+import { stringifyStackFrames, filteredStackTrace } from '@utils/stackTrace';
 import { ansiRegex, isString, stripAnsiEscapes } from '@isomorphic/stringUtils';
 
-import type { RawStack } from '@isomorphic/stackTrace';
 import type { Location } from './../types/testReporter';
 import type { TestInfoError } from './../types/test';
-import type { StackFrame } from '@protocol/channels';
 import type { TestCase } from './common/test';
 
-const PLAYWRIGHT_TEST_PATH = path.join(__dirname, '..');
-const PLAYWRIGHT_CORE_PATH = path.dirname(require.resolve('playwright-core/package.json'));
-
-export function filterStackTrace(e: Error): { message: string, stack: string, cause?: ReturnType<typeof filterStackTrace> } {
+export function filterStackTrace(e: Error): TestInfoError {
   const name = e.name ? e.name + ': ' : '';
   const cause = e.cause instanceof Error ? filterStackTrace(e.cause) : undefined;
   if (process.env.PWDEBUGIMPL)
@@ -49,29 +43,6 @@ export function filterStackTrace(e: Error): { message: string, stack: string, ca
     stack: `${name}${e.message}${stackLines.map(line => '\n' + line).join('')}`,
     cause,
   };
-}
-
-export function filterStackFile(file: string) {
-  if (process.env.PWDEBUGIMPL)
-    return true;
-  if (file.startsWith(PLAYWRIGHT_TEST_PATH))
-    return false;
-  if (file.startsWith(PLAYWRIGHT_CORE_PATH))
-    return false;
-  return true;
-}
-
-export function filteredStackTrace(rawStack: RawStack): StackFrame[] {
-  const frames: StackFrame[] = [];
-  for (const line of rawStack) {
-    const frame = parseStackFrame(line, path.sep, !!process.env.PWDEBUGIMPL);
-    if (!frame || !frame.file)
-      continue;
-    if (!filterStackFile(frame.file))
-      continue;
-    frames.push(frame);
-  }
-  return frames;
 }
 
 export function serializeError(error: Error | any): TestInfoError {
@@ -114,12 +85,12 @@ export function createFileMatcher(patterns: string | RegExp | (string | RegExp)[
         return true;
     }
     // Windows might still receive unix style paths from Cygwin or Git Bash.
-    // Check against the file url as well.
+    // Check against the forward-slash form as well.
     if (path.sep === '\\') {
-      const fileURL = url.pathToFileURL(filePath).href;
+      const unixPath = filePath.split(path.sep).join('/');
       for (const re of reList) {
         re.lastIndex = 0;
-        if (re.test(fileURL))
+        if (re.test(unixPath))
           return true;
       }
     }
@@ -186,16 +157,6 @@ export function expectTypes(receiver: any, types: ('APIResponse' | 'Page' | 'Loc
 }
 
 export const windowsFilesystemFriendlyLength = 60;
-
-export function trimLongString(s: string, length = 100) {
-  if (s.length <= length)
-    return s;
-  const hash = calculateSha1(s);
-  const middle = `-${hash.substring(0, 5)}-`;
-  const start = Math.floor((length - middle.length) / 2);
-  const end = length - middle.length - start;
-  return s.substring(0, start) + middle + s.slice(-end);
-}
 
 export function addSuffixToFilePath(filePath: string, suffix: string): string {
   const ext = path.extname(filePath);
@@ -285,12 +246,23 @@ export function fileIsModule(file: string): boolean {
   return folderIsModule(folder);
 }
 
+const packageJsonIsModuleCache = new Map<string, boolean>();
+
 function folderIsModule(folder: string): boolean {
   const packageJsonPath = getPackageJsonPath(folder);
   if (!packageJsonPath)
     return false;
-  // Rely on `require` internal caching logic.
-  return require(packageJsonPath).type === 'module';
+  // Note: do not `require()` the package.json here to avoid running
+  // our resolve hook from inside itself.
+  if (!packageJsonIsModuleCache.has(packageJsonPath)) {
+    let isModule = false;
+    try {
+      isModule = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')).type === 'module';
+    } catch {
+    }
+    packageJsonIsModuleCache.set(packageJsonPath, isModule);
+  }
+  return packageJsonIsModuleCache.get(packageJsonPath)!;
 }
 
 const packageJsonMainFieldCache = new Map<string, string | undefined>();

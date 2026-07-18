@@ -19,9 +19,9 @@ import { Dispatcher } from './dispatcher';
 import { SdkObject } from '../instrumentation';
 
 import type { ArtifactDispatcher } from './artifactDispatcher';
-import type * as channels from '@protocol/channels';
+import type * as channels from '../channels';
 import type * as stream from 'stream';
-import type { Progress } from '@protocol/progress';
+import type { Progress } from '../progress';
 
 class StreamSdkObject extends SdkObject {
   readonly stream: stream.Readable;
@@ -63,6 +63,10 @@ export class StreamDispatcher extends Dispatcher<StreamSdkObject, channels.Strea
     }
     const buffer = stream.read(Math.min(stream.readableLength, params.size || stream.readableLength));
     return { binary: buffer || Buffer.from('') };
+  }
+
+  override _onDispose() {
+    this._object.stream.destroy();
   }
 
   async close(params: channels.StreamCloseParams, progress: Progress): Promise<void> {

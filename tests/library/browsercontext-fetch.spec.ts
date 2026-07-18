@@ -17,12 +17,15 @@
 import type { LookupAddress } from 'dns';
 import formidable from 'formidable';
 import fs from 'fs';
+import http from 'http';
 import type { IncomingMessage } from 'http';
+import https from 'https';
 import { pipeline } from 'stream';
 import zlib from 'zlib';
 import { contextTest as it, expect } from '../config/browserTest';
 import { suppressCertificateWarning } from '../config/utils';
 import { kTargetClosedErrorMessage } from '../config/errors';
+import { TestServer } from '../config/testserver';
 
 it.skip(({ mode }) => mode !== 'default');
 
@@ -53,6 +56,53 @@ it('fetch should work', async ({ context, server }) => {
   expect(response.headers()['content-type']).toBe('application/json; charset=utf-8');
   expect(response.headersArray()).toContainEqual({ name: 'Content-Type', value: 'application/json; charset=utf-8' });
   expect(await response.text()).toBe('{"foo": "bar"}\n');
+});
+
+it('should return timing', async ({ context }) => {
+  // Create a fresh server to guarantee a new connection, because keep-alive
+  // sockets from other tests do not have dns/connect timings.
+  const httpServer = http.createServer((req, res) => res.end('Hello'));
+  const port = await new Promise<number>(resolve => httpServer.listen(0, () => resolve((httpServer.address() as any).port)));
+  try {
+    const response = await context.request.get(`http://localhost:${port}/`);
+    expect(response.ok()).toBeTruthy();
+    const timing = response.timing();
+    expect(timing.startTime).toBeCloseTo(Date.now(), -4);
+    expect(timing.domainLookupStart).toBe(0);
+    expect(timing.domainLookupEnd).toBeGreaterThanOrEqual(timing.domainLookupStart);
+    expect(timing.connectStart).toBe(timing.domainLookupEnd);
+    expect(timing.secureConnectionStart).toBe(-1);
+    expect(timing.connectEnd).toBeGreaterThanOrEqual(timing.connectStart);
+    expect(timing.requestStart).toBe(timing.connectEnd);
+    expect(timing.responseStart).toBeGreaterThanOrEqual(timing.requestStart);
+    expect(timing.responseEnd).toBeGreaterThanOrEqual(timing.responseStart);
+    expect(timing.responseEnd).toBeLessThan(60_000);
+  } finally {
+    await new Promise(resolve => httpServer.close(resolve));
+  }
+});
+
+it('should return timing for https', async ({ context }) => {
+  // Create a fresh server to guarantee a new connection, because keep-alive
+  // sockets from other tests do not have dns/connect timings.
+  const httpsServer = https.createServer(await TestServer.certOptions(), (req, res) => res.end('Hello'));
+  const port = await new Promise<number>(resolve => httpsServer.listen(0, () => resolve((httpsServer.address() as any).port)));
+  try {
+    const response = await context.request.get(`https://localhost:${port}/`, { ignoreHTTPSErrors: true });
+    expect(response.ok()).toBeTruthy();
+    const timing = response.timing();
+    expect(timing.startTime).toBeCloseTo(Date.now(), -4);
+    expect(timing.domainLookupStart).toBe(0);
+    expect(timing.domainLookupEnd).toBeGreaterThanOrEqual(timing.domainLookupStart);
+    expect(timing.connectStart).toBe(timing.domainLookupEnd);
+    expect(timing.secureConnectionStart).toBeGreaterThanOrEqual(timing.connectStart);
+    expect(timing.connectEnd).toBeGreaterThanOrEqual(timing.secureConnectionStart);
+    expect(timing.requestStart).toBe(timing.connectEnd);
+    expect(timing.responseStart).toBeGreaterThanOrEqual(timing.requestStart);
+    expect(timing.responseEnd).toBeGreaterThanOrEqual(timing.responseStart);
+  } finally {
+    await new Promise(resolve => httpsServer.close(resolve));
+  }
 });
 
 it('should throw on network error', async ({ context, server }) => {
@@ -786,6 +836,26 @@ it('should support gzip compression', async function({ context, server }) {
   expect(await response.text()).toBe('Hello, world!');
 });
 
+it('should support case-insensitive content-encoding', async function({ context, server }) {
+  server.setRoute('/compressed-uppercase', (req, res) => {
+    res.writeHead(200, {
+      'Content-Encoding': 'GZIP',
+      'Content-Type': 'text/plain',
+    });
+
+    const gzip = zlib.createGzip();
+    pipeline(gzip, res, err => {
+      if (err)
+        console.log(`Server error: ${err}`);
+    });
+    gzip.write('Hello, world!');
+    gzip.end();
+  });
+
+  const response = await context.request.get(server.PREFIX + '/compressed-uppercase');
+  expect(await response.text()).toBe('Hello, world!');
+});
+
 it('should throw informative error on corrupted gzip body', async function({ context, server }) {
   server.setRoute('/corrupted', (req, res) => {
     res.writeHead(200, {
@@ -1047,6 +1117,7 @@ it('should support multipart/form-data', async function({ context, server }) {
     context.request.post(server.EMPTY_PAGE, {
       multipart: {
         firstName: 'John',
+        middleName: '',
         lastName: 'Doe',
         file
       }
@@ -1056,6 +1127,7 @@ it('should support multipart/form-data', async function({ context, server }) {
   expect(serverRequest.method).toBe('POST');
   expect(serverRequest.headers['content-type']).toContain('multipart/form-data');
   expect(fields['firstName']).toBe('John');
+  expect(fields['middleName']).toBe('');
   expect(fields['lastName']).toBe('Doe');
   expect(files['file'].originalFilename).toBe(file.name);
   expect(files['file'].mimetype).toBe(file.mimeType);
@@ -1256,7 +1328,7 @@ it('should abort requests when browser context closes', async ({ contextFactory,
     server.waitForRequest('/empty.html').then(() => context.close())
   ]);
   expect(error instanceof Error).toBeTruthy();
-  expect(error.message).toContain(kTargetClosedErrorMessage);
+  expect(error.message).toMatch(/Request context disposed|Target page, context or browser has been closed/);
   await connectionClosed;
 });
 
@@ -1364,7 +1436,7 @@ it('should update host header on redirect', async ({ context, server }) => {
   });
   const reqPromise = server.waitForRequest('/test');
   const response = await context.request.get(server.PREFIX + '/redirect', {
-    headers: { host: new URL(server.PREFIX).host }
+    headers: { HosT: new URL(server.PREFIX).host }
   });
   expect(redirectCount).toBe(2);
   await expect(response).toBeOK();
@@ -1400,4 +1472,63 @@ it('should retry on ECONNRESET', {
   expect(response.status()).toBe(200);
   expect(await response.text()).toBe('Hello!');
   expect(requestCount).toBe(4);
+});
+
+it('should retry ECONNRESET on compressed response', async ({ context, server }) => {
+  let requestCount = 0;
+  server.setRoute('/test-gzip', (req, res) => {
+    if (requestCount++ < 2) {
+      req.socket.destroy();
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Encoding': 'gzip',
+      'Content-Type': 'text/plain',
+    });
+    const gzipStream = zlib.createGzip();
+    pipeline(gzipStream, res, err => {
+      if (err)
+        console.log(`Server error: ${err}`);
+    });
+    gzipStream.write('compressed-retry-ok');
+    gzipStream.end();
+  });
+  const response = await context.request.get(server.PREFIX + '/test-gzip', { maxRetries: 3 });
+  expect(response.status()).toBe(200);
+  expect(await response.text()).toBe('compressed-retry-ok');
+  expect(requestCount).toBe(3);
+});
+
+it('should retry ECONNRESET mid-stream during gzip decompression', async ({ context, server }) => {
+  let requestCount = 0;
+  server.setRoute('/test-gzip-midstream', (req, res) => {
+    requestCount++;
+    if (requestCount <= 2) {
+      // Send response headers to make client enter the decompression pipeline,
+      // then destroy the socket. This exercises the fix: without it, the
+      // pipeline error callback wraps the error, stripping .code for retry.
+      res.writeHead(200, {
+        'Content-Encoding': 'gzip',
+        'Content-Type': 'text/plain',
+      });
+      res.flushHeaders();
+      req.socket.destroy();
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Encoding': 'gzip',
+      'Content-Type': 'text/plain',
+    });
+    const gzipStream = zlib.createGzip();
+    pipeline(gzipStream, res, err => {
+      if (err)
+        console.log(`Server error: ${err}`);
+    });
+    gzipStream.write('midstream-retry-ok');
+    gzipStream.end();
+  });
+  const response = await context.request.get(server.PREFIX + '/test-gzip-midstream', { maxRetries: 3 });
+  expect(response.status()).toBe(200);
+  expect(await response.text()).toBe('midstream-retry-ok');
+  expect(requestCount).toBe(3);
 });

@@ -16,7 +16,7 @@
 
 import fs from 'fs/promises';
 
-import { test, testWithOldExtensionVersion, expect, extensionId, clickAllowAndSelect, startWithExtensionFlag } from './extension-fixtures';
+import { test, testWithOldExtensionVersion, expect, extensionId, clickAllowAndSelect, connectAndNavigate, startWithExtensionFlag } from './extension-fixtures';
 import { utils } from '../../packages/playwright-core/lib/coreBundle';
 
 const { defaultUserDataDirForChannel } = utils;
@@ -37,7 +37,7 @@ test(`navigate with extension`, async ({ startExtensionClient, server }) => {
   await clickAllowAndSelect(selectorPage, 'Welcome');
 
   expect(await navigateResponse).toHaveResponse({
-    snapshot: expect.stringContaining(`- generic [active] [ref=e1]: Hello, world!`),
+    snapshot: expect.stringContaining(`- generic [active] [ref=f1e1]: Hello, world!`),
   });
 });
 
@@ -210,7 +210,7 @@ testWithOldExtensionVersion(`works with old extension version`, async ({ startEx
   await clickAllowAndSelect(selectorPage, 'Welcome');
 
   expect(await navigateResponse).toHaveResponse({
-    snapshot: expect.stringContaining(`- generic [active] [ref=e1]: Hello, world!`),
+    snapshot: expect.stringContaining(`- generic [active] [ref=f1e1]: Hello, world!`),
   });
 });
 
@@ -290,6 +290,36 @@ test(`--browser <channel> selects channel-specific userDataDir`, {
   });
 });
 
+test(`browser_cookie_list and browser_cookie_set work in extension mode`, {
+  annotation: { type: 'issue', description: 'https://github.com/microsoft/playwright/issues/40687' },
+}, async ({ browserWithExtension, startClient, server }) => {
+  const browserContext = await browserWithExtension.launch();
+  const { client } = await startClient({
+    args: [`--extension`],
+    config: { capabilities: ['storage'] },
+    env: {
+      PWTEST_EXTENSION_USER_DATA_DIR: browserWithExtension.userDataDir,
+    },
+  });
+
+  await connectAndNavigate(browserContext, client, server.HELLO_WORLD);
+
+  // Storage.setCookie / Storage.getCookies are browser-level CDP commands
+  // (no sessionId) and used to be rejected outright by the v2 relay.
+  await client.callTool({
+    name: 'browser_cookie_set',
+    arguments: { name: 'extCookie', value: 'extValue' },
+  });
+  const result = await client.callTool({
+    name: 'browser_cookie_list',
+    arguments: {},
+  });
+
+  expect(result).toHaveResponse({
+    result: expect.stringContaining('extCookie=extValue'),
+  });
+});
+
 test(`bypass connection dialog with token`, async ({ browserWithExtension, startClient, server }) => {
   const browserContext = await browserWithExtension.launch();
 
@@ -312,7 +342,7 @@ test(`bypass connection dialog with token`, async ({ browserWithExtension, start
   });
 
   expect(await navigateResponse).toHaveResponse({
-    snapshot: expect.stringContaining(`- generic [active] [ref=e1]: Hello, world!`),
+    snapshot: expect.stringContaining(`- generic [active] [ref=f1e1]: Hello, world!`),
   });
 });
 

@@ -27,10 +27,10 @@ import { calculateSha1 } from '@utils/crypto';
 import { ZipFile } from '@utils/zipFile';
 import { removeFolders, resolveWithinRoot } from '@utils/fileUtils';
 import { HarBackend } from './harBackend';
-import type * as channels from '@protocol/channels';
+import type * as channels from './channels';
 import type * as har from '@trace/har';
 import type EventEmitter from 'events';
-import type { Progress } from '@protocol/progress';
+import type { Progress } from './progress';
 
 
 export type StackSession = {
@@ -101,7 +101,26 @@ export async function zip(progress: Progress, stackSessions: Map<string, StackSe
       return;
     }
     assert(inZipFile);
+    inZipFile.on('error', error => promise.reject(error));
     let pendingEntries = inZipFile.entryCount;
+
+    const finalizeRepack = () => {
+      zipFile.end(undefined, () => {
+        zipFile.outputStream.pipe(fs.createWriteStream(params.zipFile))
+            .on('close', () => {
+              fs.promises.unlink(tempFile).then(() => {
+                promise.resolve();
+              }).catch(error => promise.reject(error));
+            })
+            .on('error', error => promise.reject(error));
+      });
+    };
+
+    if (pendingEntries === 0) {
+      finalizeRepack();
+      return;
+    }
+
     inZipFile.on('entry', entry => {
       inZipFile.openReadStream(entry, (err, readStream) => {
         if (err) {
@@ -109,15 +128,8 @@ export async function zip(progress: Progress, stackSessions: Map<string, StackSe
           return;
         }
         zipFile.addReadStream(readStream!, entry.fileName);
-        if (--pendingEntries === 0) {
-          zipFile.end(undefined, () => {
-            zipFile.outputStream.pipe(fs.createWriteStream(params.zipFile)).on('close', () => {
-              fs.promises.unlink(tempFile).then(() => {
-                promise.resolve();
-              }).catch(error => promise.reject(error));
-            });
-          });
-        }
+        if (--pendingEntries === 0)
+          finalizeRepack();
       });
     });
   });
@@ -136,9 +148,16 @@ async function deleteStackSession(progress: Progress, stackSessions: Map<string,
 }
 
 export async function harOpen(progress: Progress, harBackends: Map<string, HarBackend>, params: channels.LocalUtilsHarOpenParams): Promise<channels.LocalUtilsHarOpenResult> {
-  let harBackend: HarBackend;
-  if (params.file.endsWith('.zip')) {
-    const zipFile = new ZipFile(params.file);
+  const result = await openHarBackend(progress, params.file);
+  if ('error' in result)
+    return { error: result.error };
+  harBackends.set(result.harBackend.id, result.harBackend);
+  return { harId: result.harBackend.id };
+}
+
+export async function openHarBackend(progress: Progress, file: string): Promise<{ harBackend: HarBackend } | { error: string }> {
+  if (file.endsWith('.zip')) {
+    const zipFile = new ZipFile(file);
     try {
       const entryNames = await progress.race(zipFile.entries());
       const harEntryName = entryNames.find(e => e.endsWith('.har'));
@@ -146,17 +165,14 @@ export async function harOpen(progress: Progress, harBackends: Map<string, HarBa
         return { error: 'Specified archive does not have a .har file' };
       const har = await progress.race(zipFile.read(harEntryName));
       const harFile = JSON.parse(har.toString()) as har.HARFile;
-      harBackend = new HarBackend(harFile, null, zipFile);
+      return { harBackend: new HarBackend(harFile, null, zipFile) };
     } catch (error) {
       zipFile.close();
       throw error;
     }
-  } else {
-    const harFile = JSON.parse(await progress.race(fs.promises.readFile(params.file, 'utf-8'))) as har.HARFile;
-    harBackend = new HarBackend(harFile, path.dirname(params.file), null);
   }
-  harBackends.set(harBackend.id, harBackend);
-  return { harId: harBackend.id };
+  const harFile = JSON.parse(await progress.race(fs.promises.readFile(file, 'utf-8'))) as har.HARFile;
+  return { harBackend: new HarBackend(harFile, path.dirname(file), null) };
 }
 
 export async function harLookup(progress: Progress, harBackends: Map<string, HarBackend>, params: channels.LocalUtilsHarLookupParams): Promise<channels.LocalUtilsHarLookupResult> {
@@ -205,6 +221,9 @@ export async function tracingStarted(progress: Progress, stackSessions: Map<stri
   if (!params.tracesDir)
     tmpDir = await progress.race(fs.promises.mkdtemp(path.join(os.tmpdir(), 'playwright-tracing-')));
   const traceStacksFile = path.join(params.tracesDir || tmpDir!, params.traceName + '.stacks');
+  // Ensure the directory exists before addStackToTracingNoReply races ahead of
+  // the tracing recorder's own (separately queued) mkdir.
+  await progress.race(fs.promises.mkdir(path.dirname(traceStacksFile), { recursive: true }));
   stackSessions.set(traceStacksFile, { callStacks: [], file: traceStacksFile, writer: Promise.resolve(), tmpDir, live: params.live });
   return { stacksId: traceStacksFile };
 }

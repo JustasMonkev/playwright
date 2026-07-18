@@ -48,11 +48,11 @@ import type { APIRequestContext } from '../../fetch';
 import type { HarTracerDelegate } from '../../har/harTracer';
 import type { CallMetadata, InstrumentationListener } from '../../instrumentation';
 import type { PageError } from '../../page';
-import type { RecordHarOptions, StackFrame, TracingTracingStopChunkParams } from '@protocol/channels';
+import type { RecordHarOptions, StackFrame, TracingTracingStopChunkParams } from '../../channels';
 import type * as har from '@trace/har';
 import type { FrameSnapshot } from '@trace/snapshot';
 import type * as trace from '@trace/trace';
-import type { Progress } from '@protocol/progress';
+import type { Progress } from '../../progress';
 import type * as types from '../../types';
 import type { Screencast, ScreencastClient } from '../../screencast';
 
@@ -222,6 +222,7 @@ export class Tracing extends SdkObject implements InstrumentationListener, Snaps
     );
     if (this._state.options.screenshots)
       this._startScreencast();
+    this._harTracer.setOmitWebSocketFrames(!!process.env.PLAYWRIGHT_TRACING_NO_WEBSOCKET_FRAMES);
     if (this._state.options.snapshots)
       await this._snapshotter?.start(progress);
     return { traceName: this._state.traceName };
@@ -393,7 +394,9 @@ export class Tracing extends SdkObject implements InstrumentationListener, Snaps
     eventsHelper.removeEventListeners(this._eventListeners);
     if (this._state.options.screenshots)
       this._stopScreencast();
-
+    // We don't need websocket frames outside of the recording window. This also
+    // stops updating websocket content blobs, which we want to stay unchanged for zipping.
+    this._harTracer.setOmitWebSocketFrames(true);
     if (this._state.options.snapshots)
       this._snapshotter?.stop();
 
@@ -458,10 +461,10 @@ export class Tracing extends SdkObject implements InstrumentationListener, Snaps
     return { artifact };
   }
 
-  private async _captureSnapshot(snapshotName: string | undefined, sdkObject: SdkObject, metadata: CallMetadata): Promise<void> {
+  private async _captureSnapshot(snapshotName: string | undefined, sdkObject: SdkObject, metadata: CallMetadata, resetTargets: boolean): Promise<void> {
     if (!snapshotName || !sdkObject.attribution.page)
       return;
-    await this._snapshotter?.captureSnapshot(sdkObject.attribution.page, metadata.id, snapshotName).catch(() => {});
+    await this._snapshotter?.captureSnapshot(sdkObject.attribution.page, metadata.id, snapshotName, resetTargets).catch(() => {});
   }
 
   private _shouldCaptureSnapshot(sdkObject: SdkObject, metadata: CallMetadata, phase: 'before' | 'after' | 'input') {
@@ -489,21 +492,21 @@ export class Tracing extends SdkObject implements InstrumentationListener, Snaps
       event.beforeSnapshot = `before@${metadata.id}`;
     this._state?.callIds.add(metadata.id);
     this._appendTraceEvent(event);
-    return this._captureSnapshot(event.beforeSnapshot, sdkObject, metadata);
+    return this._captureSnapshot(event.beforeSnapshot, sdkObject, metadata, true);
   }
 
-  onBeforeInputAction(sdkObject: SdkObject, metadata: CallMetadata) {
+  onBeforeInputAction(sdkObject: SdkObject, metadata: CallMetadata, point?: types.Point) {
     // IMPORTANT: no awaits in this method, this._appendTraceEvent must be called synchronously.
     if (!this._state?.callIds.has(metadata.id))
       return Promise.resolve();
-    const event = createInputActionTraceEvent(metadata);
+    const event = createInputActionTraceEvent(metadata, point);
     if (!event)
       return Promise.resolve();
     this._temporarilyDisableThrottling(sdkObject.attribution.page);
     if (this._shouldCaptureSnapshot(sdkObject, metadata, 'input'))
       event.inputSnapshot = `input@${metadata.id}`;
     this._appendTraceEvent(event);
-    return this._captureSnapshot(event.inputSnapshot, sdkObject, metadata);
+    return this._captureSnapshot(event.inputSnapshot, sdkObject, metadata, false);
   }
 
   onCallLog(sdkObject: SdkObject, metadata: CallMetadata, logName: string, message: string) {
@@ -530,7 +533,7 @@ export class Tracing extends SdkObject implements InstrumentationListener, Snaps
     if (this._shouldCaptureSnapshot(sdkObject, metadata, 'after'))
       event.afterSnapshot = `after@${metadata.id}`;
     this._appendTraceEvent(event);
-    return this._captureSnapshot(event.afterSnapshot, sdkObject, metadata);
+    return this._captureSnapshot(event.afterSnapshot, sdkObject, metadata, false);
   }
 
   onEntryStarted(entry: har.Entry) {
@@ -558,6 +561,12 @@ export class Tracing extends SdkObject implements InstrumentationListener, Snaps
 
   onContentBlob(sha1: string, buffer: Buffer) {
     this._appendResource(sha1, buffer);
+  }
+
+  onContentBlobAppend(sha1: string, text: string) {
+    if (!this._allResources.has(sha1))
+      this._allResources.add(sha1);
+    this._fs.appendFile(path.join(this._state!.resourcesDir, sha1), text, this._state!.options.live /* flush */);
   }
 
   onSnapshotterBlob(blob: SnapshotterBlob): void {
@@ -623,6 +632,8 @@ export class Tracing extends SdkObject implements InstrumentationListener, Snaps
       params: { pageId: page.guid },
     };
     this._appendTraceEvent(event);
+    this._pageTracingRecorders.get(page)?.dispose();
+    this._pageTracingRecorders.delete(page);
   }
 
   dispose(params: TracingTracingStopChunkParams) {
@@ -727,7 +738,7 @@ function createBeforeActionTraceEvent(metadata: CallMetadata, parentId?: string)
     title: metadata.title,
     class: metadata.type,
     method: metadata.method,
-    params: metadata.params,
+    params: metadata.timeout ? { ...metadata.params, timeout: metadata.timeout } : metadata.params,
     stepId: metadata.stepId,
     pageId: metadata.pageId,
   };
@@ -736,13 +747,13 @@ function createBeforeActionTraceEvent(metadata: CallMetadata, parentId?: string)
   return event;
 }
 
-function createInputActionTraceEvent(metadata: CallMetadata): trace.InputActionTraceEvent | null {
+function createInputActionTraceEvent(metadata: CallMetadata, point: types.Point | undefined): trace.InputActionTraceEvent | null {
   if (metadata.internal || metadata.method.startsWith('tracing'))
     return null;
   return {
     type: 'input',
     callId: metadata.id,
-    point: metadata.point,
+    point,
   };
 }
 
@@ -766,7 +777,6 @@ function createAfterActionTraceEvent(metadata: CallMetadata): trace.AfterActionT
     endTime: metadata.endTime,
     error: metadata.error?.error,
     result: metadata.result,
-    point: metadata.point,
   };
 }
 

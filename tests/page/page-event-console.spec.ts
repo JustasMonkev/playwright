@@ -18,14 +18,14 @@
 import { test as it, expect } from './pageTest';
 import util from 'util';
 
-it('should work @smoke', async ({ page, browserName, channel }) => {
+it('should work @smoke', async ({ page, browserName, isBidi }) => {
   let message = null;
   page.once('console', m => message = m);
   await Promise.all([
     page.evaluate(() => console.log('hello', 5, { foo: 'bar' })),
     page.waitForEvent('console')
   ]);
-  if (browserName !== 'firefox' || channel?.startsWith('moz-firefox'))
+  if (browserName !== 'firefox' || isBidi)
     expect(message.text()).toEqual('hello 5 {foo: bar}');
   else
     expect(message.text()).toEqual('hello 5 JSHandle@object');
@@ -117,14 +117,14 @@ it('should format the message correctly with time/timeLog/timeEnd', async ({ pag
   expect(messages[1].text()).toMatch(/foo time: \d+(.\d+)? ?ms/);
 });
 
-it('should not fail for window object', async ({ page, browserName, channel }) => {
+it('should not fail for window object', async ({ page, browserName, isBidi }) => {
   let message = null;
   page.once('console', msg => message = msg);
   await Promise.all([
     page.evaluate(() => console.error(window)),
     page.waitForEvent('console')
   ]);
-  if (browserName !== 'firefox' || channel?.startsWith('moz-firefox'))
+  if (browserName !== 'firefox' || isBidi)
     expect(message.text()).toEqual('Window');
   else
     expect(message.text()).toEqual('JSHandle@object');
@@ -181,14 +181,14 @@ it('should not throw when there are console messages in detached iframes', async
   expect(await popup.evaluate('1 + 1')).toBe(2);
 });
 
-it('should use object previews for arrays and objects', async ({ page, browserName, channel }) => {
+it('should use object previews for arrays and objects', async ({ page, browserName, isBidi }) => {
   let text: string;
   page.on('console', message => {
     text = message.text();
   });
   await page.evaluate(() => console.log([1, 2, 3], { a: 1 }, window));
 
-  if (browserName !== 'firefox' || channel?.startsWith('moz-firefox'))
+  if (browserName !== 'firefox' || isBidi)
     expect(text).toEqual('[1, 2, 3] {a: 1} Window');
   else
     expect(text).toEqual('Array JSHandle@object JSHandle@object');
@@ -229,12 +229,14 @@ it('do not update console count on unhandled rejections', async ({ page }) => {
 it('should have timestamp', async ({ page, isAndroid }) => {
   it.skip(isAndroid, 'there is a time difference between android emulator and host machine');
 
-  const before = Date.now() - 1;  // Account for the rounding of fractional timestamps.
+  // Generous slack to absorb host wall-clock resolution (e.g. ~15.6ms on Windows)
+  // vs sub-millisecond browser timestamps.
+  const before = Date.now() - 100;
   const [message] = await Promise.all([
     page.waitForEvent('console'),
     page.evaluate(() => console.log('timestamp test')),
   ]);
-  const after = Date.now() + 1;  // Account for the rounding of fractional timestamps.
+  const after = Date.now() + 100;
   expect(message.timestamp()).toBeGreaterThanOrEqual(before);
   expect(message.timestamp()).toBeLessThanOrEqual(after);
 });
@@ -255,9 +257,11 @@ it('should have increasing timestamps', async ({ page }) => {
 it('should have timestamp in consoleMessages', async ({ page, isAndroid }) => {
   it.skip(isAndroid, 'there is a time difference between android emulator and host machine');
 
-  const before = Date.now() - 1;  // Account for the rounding of fractional timestamps.
+  // Generous slack to absorb host wall-clock resolution (e.g. ~15.6ms on Windows)
+  // vs sub-millisecond browser timestamps.
+  const before = Date.now() - 100;
   await page.evaluate(() => console.log('stored message'));
-  const after = Date.now() + 1;  // Account for the rounding of fractional timestamps.
+  const after = Date.now() + 100;
   const messages = await page.consoleMessages();
   expect(messages.length).toBeGreaterThanOrEqual(1);
   const last = messages[messages.length - 1];

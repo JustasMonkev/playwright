@@ -33,6 +33,9 @@ const numberArg = z.preprocess((val, ctx) => {
   return number;
 }, z.number());
 
+// Minimist returns a string for a single occurrence and an array for repeated.
+const stringArrayArg = z.union([z.string(), z.array(z.string())]).transform(v => Array.isArray(v) ? v : [v]);
+
 // Navigation commands
 
 const open = declareCommand({
@@ -45,7 +48,9 @@ const open = declareCommand({
   options: z.object({
     browser: z.string().optional().describe('Browser or chrome channel to use, possible values: chrome, firefox, webkit, msedge.'),
     config: z.string().optional().describe('Path to the configuration file, defaults to .playwright/cli.config.json'),
+    device: z.string().optional().describe('Emulate a specific device, for example "iPhone 15".'),
     headed: z.boolean().optional().describe('Run browser in headed mode'),
+    mobile: z.boolean().optional().describe('Emulate a generic mobile device (Pixel 10 for Chromium, iPhone 17 for WebKit). Mobile pages are usually lighter, which saves tokens.'),
     persistent: z.boolean().optional().describe('Use persistent browser profile'),
     profile: z.string().optional().describe('Path to a persistent user data directory.'),
   }),
@@ -235,7 +240,7 @@ const click = declareCommand({
     button: z.string().optional().describe('Button to click, defaults to left'),
   }),
   options: z.object({
-    modifiers: z.array(z.string()).optional().describe('Modifier keys to press'),
+    modifiers: stringArrayArg.optional().describe('Modifier key to press (repeatable)'),
   }),
   toolName: 'browser_click',
   toolParams: ({ target, button, modifiers }) => ({ target, button, modifiers }),
@@ -250,7 +255,7 @@ const doubleClick = declareCommand({
     button: z.string().optional().describe('Button to click, defaults to left'),
   }),
   options: z.object({
-    modifiers: z.array(z.string()).optional().describe('Modifier keys to press'),
+    modifiers: stringArrayArg.optional().describe('Modifier key to press (repeatable)'),
   }),
   toolName: 'browser_click',
   toolParams: ({ target, button, modifiers }) => ({ target, button, modifiers, doubleClick: true }),
@@ -276,8 +281,8 @@ const drop = declareCommand({
     target: z.string().describe(elementTargetDescription),
   }),
   options: z.object({
-    path: z.union([z.string(), z.array(z.string())]).optional().transform(v => v ? (Array.isArray(v) ? v : [v]) : undefined).describe('Absolute path to a file to drop onto the element (repeatable)'),
-    data: z.union([z.string(), z.array(z.string())]).optional().transform(v => v ? (Array.isArray(v) ? v : [v]) : undefined).describe('Data to drop in "mime/type=value" format, e.g. --data "text/plain=hello" (repeatable)'),
+    path: stringArrayArg.optional().describe('Absolute path to a file to drop onto the element (repeatable)'),
+    data: stringArrayArg.optional().describe('Data to drop in "mime/type=value" format, e.g. --data "text/plain=hello" (repeatable)'),
   }),
   toolName: 'browser_drop',
   toolParams: ({ target, path, data }) => {
@@ -380,6 +385,20 @@ const snapshot = declareCommand({
   }),
   toolName: 'browser_snapshot',
   toolParams: ({ filename, target, depth, boxes }) => ({ filename, target, depth, boxes }),
+});
+
+const find = declareCommand({
+  name: 'find',
+  description: 'Search the page snapshot for text or a regexp, returning matching nodes with surrounding context (like search snippets)',
+  category: 'core',
+  args: z.object({
+    text: z.string().optional().describe('Plain text to search for in the page snapshot (case-insensitive substring match)'),
+  }),
+  options: z.object({
+    regex: z.string().optional().describe('Regular expression to search for in the page snapshot. Provide either a text argument or --regex, not both.'),
+  }),
+  toolName: 'browser_find',
+  toolParams: ({ text, regex }) => ({ text, regex }),
 });
 
 const generateLocator = declareCommand({
@@ -730,7 +749,7 @@ const routeMock = declareCommand({
     status: numberArg.optional().describe('HTTP status code (default: 200)'),
     body: z.string().optional().describe('Response body (text or JSON string)'),
     ['content-type']: z.string().optional().describe('Content-Type header'),
-    header: z.union([z.string(), z.array(z.string())]).optional().transform(v => v ? (Array.isArray(v) ? v : [v]) : undefined).describe('Header to add in "Name: Value" format (repeatable)'),
+    header: stringArrayArg.optional().describe('Header to add in "Name: Value" format (repeatable)'),
     ['remove-header']: z.string().optional().describe('Comma-separated header names to remove'),
   }),
   toolName: 'browser_route',
@@ -786,11 +805,13 @@ const screenshot = declareCommand({
     target: z.string().optional().describe(elementTargetDescription),
   }),
   options: z.object({
-    filename: z.string().optional().describe('File name to save the screenshot to. Defaults to `page-{timestamp}.{png|jpeg}` if not specified.'),
+    filename: z.string().optional().describe('File name to save the screenshot to. Defaults to `page-{timestamp}.{png|jpeg|webp}` if not specified.'),
+    type: z.enum(['png', 'jpeg', 'webp']).optional().describe('Image format. If unset, inferred from the filename extension, otherwise png.'),
     ['full-page']: z.boolean().optional().describe('When true, takes a screenshot of the full scrollable page, instead of the currently visible viewport.'),
+    hires: z.boolean().optional().describe('When true, captures a high-resolution screenshot using device pixels (accounts for the device pixel ratio), instead of CSS pixels.'),
   }),
   toolName: 'browser_take_screenshot',
-  toolParams: ({ target, filename, ['full-page']: fullPage }) => ({ filename, target, fullPage }),
+  toolParams: ({ target, filename, type, ['full-page']: fullPage, hires }) => ({ filename, target, type, fullPage, scale: hires ? 'device' : undefined }),
 });
 
 const pdfSave = declareCommand({
@@ -969,6 +990,31 @@ const videoChapter = declareCommand({
   toolParams: ({ title, description, duration }) => ({ title, description, duration }),
 });
 
+const actionPositionArg = z.enum(['top-left', 'top', 'top-right', 'bottom-left', 'bottom', 'bottom-right']);
+const actionCursorArg = z.enum(['none', 'pointer']);
+
+const videoShowActions = declareCommand({
+  name: 'video-show-actions',
+  description: 'Annotate subsequent CLI/MCP actions on the page with a callout that names the action and highlights the target element',
+  category: 'devtools',
+  args: z.object({}),
+  options: z.object({
+    duration: numberArg.optional().describe('How long each action annotation stays on screen, in milliseconds. Defaults to 500.'),
+    position: actionPositionArg.optional().describe('Where to place the action title: top-left, top, top-right, bottom-left, bottom, bottom-right. Defaults to top-right.'),
+    cursor: actionCursorArg.optional().describe('Cursor decoration: "pointer" (default) animates a mouse pointer between action points; "none" disables it.'),
+  }),
+  toolName: 'browser_video_show_actions',
+  toolParams: ({ duration, position, cursor }) => ({ duration, position, cursor }),
+});
+
+const videoHideActions = declareCommand({
+  name: 'video-hide-actions',
+  description: 'Stop annotating actions performed on the page',
+  category: 'devtools',
+  toolName: 'browser_video_hide_actions',
+  toolParams: () => ({}),
+});
+
 const dashboardShow = declareCommand({
   name: 'show',
   description: 'Show Playwright Dashboard',
@@ -1120,6 +1166,7 @@ const commandsArray: AnyCommandSchema[] = [
   check,
   uncheck,
   snapshot,
+  find,
   evaluate,
   consoleList,
   dialogAccept,
@@ -1198,6 +1245,8 @@ const commandsArray: AnyCommandSchema[] = [
   videoStart,
   videoStop,
   videoChapter,
+  videoShowActions,
+  videoHideActions,
   dashboardShow,
   pauseAt,
   resume,

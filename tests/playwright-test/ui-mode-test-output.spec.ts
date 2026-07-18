@@ -103,12 +103,12 @@ test('should show console messages for test', async ({ runUITest }, testInfo) =>
     'Colors: RED GREEN',
   ]);
 
-  await expect(page.locator('.console-tab .list-view-entry .codicon')).toHaveClass([
-    'codicon codicon-browser status-none',
-    'codicon codicon-file status-none',
-    'codicon codicon-browser status-error',
-    'codicon codicon-file status-error',
-    'codicon codicon-file status-none',
+  await expect(page.locator('.console-tab .console-source')).toHaveText([
+    'page',
+    'test',
+    'page',
+    'test',
+    'test',
   ]);
 
   await expect.soft(page.getByText('RED', { exact: true })).toHaveCSS('color', 'rgb(205, 49, 49)');
@@ -254,7 +254,7 @@ test('should print beforeAll console messages once', async ({ runUITest }, testI
   await page.getByTitle('Run all').click();
   await page.getByText('Console').click();
   await page.getByText('print').click();
-  await expect(page.getByTestId('status-line')).toHaveText('1/1 passed (100%)');
+  await expect(page.getByTestId('status-line')).toHaveText('1/1 (100%) — 1 passed');
   await expect(page.locator('.console-tab .console-line-message')).toHaveText([
     'before all log',
     'test log',

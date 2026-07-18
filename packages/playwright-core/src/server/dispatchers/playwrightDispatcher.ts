@@ -22,6 +22,7 @@ import { AndroidDeviceDispatcher } from './androidDispatcher';
 import { BrowserDispatcher } from './browserDispatcher';
 import { BrowserTypeDispatcher } from './browserTypeDispatcher';
 import { Dispatcher } from './dispatcher';
+import { ElectronDispatcher } from './electronDispatcher';
 import { LocalUtilsDispatcher } from './localUtilsDispatcher';
 import { APIRequestContextDispatcher } from './networkDispatchers';
 import { SdkObject } from '../instrumentation';
@@ -32,8 +33,8 @@ import type { RegisteredListener } from '@utils/eventsHelper';
 import type { AndroidDevice } from '../android/android';
 import type { Browser } from '../browser';
 import type { Playwright } from '../playwright';
-import type * as channels from '@protocol/channels';
-import type { Progress } from '@protocol/progress';
+import type * as channels from '../channels';
+import type { Progress } from '../progress';
 
 export type PlaywrightDispatcherOptions = {
   socksProxy?: SocksProxy;
@@ -59,6 +60,7 @@ export class PlaywrightDispatcher extends Dispatcher<Playwright, channels.Playwr
       firefox,
       webkit,
       android,
+      electron: new ElectronDispatcher(scope, playwright.electron, denyLaunch),
       utils: playwright.options.isServer ? undefined : new LocalUtilsDispatcher(scope, playwright),
       socksSupport: options.socksProxy ? new SocksSupportDispatcher(scope, playwright, options.socksProxy) : undefined,
     };

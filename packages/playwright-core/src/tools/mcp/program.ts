@@ -46,6 +46,7 @@ export function decorateMCPCommand(command: Command) {
       .option('--config <path>', 'path to the configuration file.')
       .option('--console-level <level>', 'level of console messages to return: "error", "warning", "info", "debug". Each level includes the messages of more severe levels.', enumParser.bind(null, '--console-level', ['error', 'warning', 'info', 'debug']))
       .option('--device <device>', 'device to emulate, for example: "iPhone 15"')
+      .option('--mobile', 'emulate a generic mobile device (Pixel 10 for Chromium, iPhone 17 for WebKit). Mobile pages are usually lighter, which saves tokens. Cannot be combined with --device.')
       .option('--executable-path <path>', 'path to the browser executable.')
       .option('--extension', 'Connect to a running browser instance (Edge/Chrome only). Requires the "Playwright Extension" to be installed.')
       .option('--endpoint <endpoint>', 'Bound browser endpoint to connect to.')
@@ -59,10 +60,11 @@ export function decorateMCPCommand(command: Command) {
       .option('--image-responses <mode>', 'whether to send image responses to the client. Can be "allow" or "omit", Defaults to "allow".', enumParser.bind(null, '--image-responses', ['allow', 'omit']))
       .option('--no-sandbox', 'disable the sandbox for all process types that are normally sandboxed.')
       .option('--output-dir <path>', 'path to the directory for output files.')
-      .option('--output-mode <mode>', 'whether to save snapshots, console messages, network logs to a file or to the standard output. Can be "file" or "stdout". Default is "stdout".', enumParser.bind(null, '--output-mode', ['file', 'stdout']))
+      .option('--output-max-size <bytes>', 'Threshold for evicting old output files, in bytes.', numberParser)
       .option('--port <port>', 'port to listen on for SSE transport.')
       .option('--proxy-bypass <bypass>', 'comma-separated domains to bypass proxy, for example ".com,chromium.org,.domain.com"')
       .option('--proxy-server <proxy>', 'specify proxy server, for example "http://myproxy:3128" or "socks5://myproxy:8080"')
+      .addOption(new ProgramOption('--remote-header <headers...>', 'headers to send with the remote endpoint connect request, multiple can be specified.').argParser(headerParser).hideHelp())
       .option('--sandbox', 'enable the sandbox for all process types that are normally not sandboxed.')
       .option('--save-session', 'Whether to save the Playwright MCP session into the output directory.')
       .option('--secrets <path>', 'path to a file containing secrets in the dotenv format', dotenvFileLoader)
@@ -86,7 +88,8 @@ export function decorateMCPCommand(command: Command) {
         if (options.vision) {
           // eslint-disable-next-line no-console
           console.error('The --vision option is deprecated, use --caps=vision instead');
-          options.caps = 'vision';
+          options.caps ??= [];
+          options.caps.push('vision');
         }
 
         if (options.caps?.includes('tracing'))
@@ -95,7 +98,7 @@ export function decorateMCPCommand(command: Command) {
         const config = await resolveCLIConfigForMCP(options);
         const tools = filteredTools(config);
         const useSharedBrowser = config.sharedBrowserContext || config.browser.isolated;
-        let sharedBrowser: playwright.Browser | undefined;
+        let sharedBrowserPromise: Promise<playwright.Browser> | undefined;
         let clientCount = 0;
         const clientNameCounters = new Map<string, number>();
 
@@ -105,14 +108,19 @@ export function decorateMCPCommand(command: Command) {
           version,
           toolSchemas: tools.map(tool => tool.schema),
           create: async (clientInfo: ClientInfo) => {
-            if (useSharedBrowser && clientCount === 0) {
-              const { browser, canBind } = await createBrowserWithInfo(config, clientInfo, options);
-              sharedBrowser = browser;
-              if (canBind)
-                await browser.bind(clientInfo.clientName, { workspaceDir: clientInfo.cwd });
+            if (useSharedBrowser && !sharedBrowserPromise) {
+              sharedBrowserPromise = (async () => {
+                const { browser, canBind } = await createBrowserWithInfo(config, clientInfo, options);
+                if (canBind)
+                  await browser.bind(clientInfo.clientName, { workspaceDir: clientInfo.cwd });
+                return browser;
+              })().catch(error => {
+                sharedBrowserPromise = undefined;
+                throw error;
+              });
             }
             clientCount++;
-            const { browser, canBind } = sharedBrowser ? { browser: sharedBrowser, canBind: false } : await createBrowserWithInfo(config, clientInfo, options);
+            const { browser, canBind } = sharedBrowserPromise ? { browser: await sharedBrowserPromise, canBind: false } : await createBrowserWithInfo(config, clientInfo, options);
             if (canBind) {
               const count = (clientNameCounters.get(clientInfo.clientName) ?? 0) + 1;
               clientNameCounters.set(clientInfo.clientName, count);
@@ -124,14 +132,20 @@ export function decorateMCPCommand(command: Command) {
           },
           disposed: async backend => {
             clientCount--;
-            if (sharedBrowser && clientCount > 0)
+            const browserContext = (backend as BrowserBackend).browserContext;
+
+            if (sharedBrowserPromise && clientCount > 0) {
+              if (config.browser.isolated) {
+                testDebug('close context');
+                await browserContext.close().catch(() => { });
+              }
               return;
+            }
 
             testDebug('close browser');
-            sharedBrowser = undefined;
-            const browserContext = (backend as BrowserBackend).browserContext;
+            sharedBrowserPromise = undefined;
             await browserContext.close().catch(() => { });
-            await browserContext.browser()!.close().catch(() => { });
+            await browserContext.browser()?.close().catch(() => { });
           }
         };
         await mcpServer.start(factory, config.server);

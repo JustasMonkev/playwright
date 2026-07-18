@@ -24,12 +24,11 @@ import { escapeHTML } from '@isomorphic/stringUtils';
 import { jsonStringifyForceASCII } from '@utils/ascii';
 import { createGuid } from '@utils/crypto';
 import { debugMode } from '@utils/debug';
-import { setBoxedStackPrefixes } from '@utils/nodePlatform';
+import { debugLogger } from '@utils/debugLogger';
 import { currentZone } from '@utils/zones';
 import { buildErrorContext } from './errorContext';
 import { config, testType } from './common';
 import * as globals from './globals';
-import { packageRoot } from './package';
 import { createCustomMessageHandler, runDaemonForContext } from './mcp/test/browserBackend';
 
 import type { Fixtures, PlaywrightTestArgs, PlaywrightTestOptions, PlaywrightWorkerArgs, PlaywrightWorkerOptions, ScreenshotMode, TestInfo, TestType, VideoMode } from '../types/test';
@@ -45,8 +44,6 @@ import type { BrowserContext, BrowserContextOptions, LaunchOptions, Page, Tracin
 
 export { expect } from './matchers/expect';
 export const _baseTest: TestType<{}, {}> = testType.rootTestType.test;
-
-setBoxedStackPrefixes([packageRoot]);
 
 if ((process as any)['__pw_initiator__']) {
   const originalStackTraceLimit = Error.stackTraceLimit;
@@ -418,17 +415,6 @@ const playwrightFixtures: Fixtures<TestFixtures, WorkerFixtures, UtilityTestFixt
       } : {};
       const context = await browser.newContext({ ...videoOptions, ...options }) as BrowserContextImpl;
 
-      if (process.env.PW_CLOCK === 'frozen') {
-        await context._wrapApiCall(async () => {
-          await context.clock.install({ time: 0 });
-          await context.clock.pauseAt(1000);
-        }, { internal: true });
-      } else if (process.env.PW_CLOCK === 'realtime') {
-        await context._wrapApiCall(async () => {
-          await context.clock.install({ time: 0 });
-        }, { internal: true });
-      }
-
       let closed = false;
       const close = async () => {
         if (closed)
@@ -436,8 +422,7 @@ const playwrightFixtures: Fixtures<TestFixtures, WorkerFixtures, UtilityTestFixt
         closed = true;
         const closeReason = testInfo.status === 'timedOut' ? 'Test timeout of ' + testInfo.timeout + 'ms exceeded.' : 'Test ended.';
         await context.close({ reason: closeReason });
-        const testFailed = testInfo.status !== testInfo.expectedStatus;
-        const preserveVideo = captureVideo && (videoMode === 'on' || (testFailed && videoMode === 'retain-on-failure') || (videoMode === 'on-first-retry' && testInfo.retry === 1));
+        const preserveVideo = captureVideo && shouldPreserveVideo(videoMode, testInfo);
         if (preserveVideo) {
           const { pagesWithVideo: pagesForVideo } = contexts.get(context)!;
           const videos = pagesForVideo.map(p => p.video()).filter(video => !!video);
@@ -467,9 +452,11 @@ const playwrightFixtures: Fixtures<TestFixtures, WorkerFixtures, UtilityTestFixt
   _optionContextReuseMode: ['none', { scope: 'worker', option: true, box: true }],
   _optionConnectOptions: [undefined, { scope: 'worker', option: true, box: true }],
 
-  _reuseContext: [async ({ video, _optionContextReuseMode }, use) => {
+  reuseContext: [false, { scope: 'worker', option: true, box: true }],
+
+  _reuseContext: [async ({ video, _optionContextReuseMode, reuseContext }, use) => {
     let mode = _optionContextReuseMode;
-    if (process.env.PW_TEST_REUSE_CONTEXT)
+    if (process.env.PW_TEST_REUSE_CONTEXT || reuseContext)
       mode = 'when-possible';
     const reuse = mode === 'when-possible' && normalizeVideoMode(video) === 'off';
     await use(reuse);
@@ -521,7 +508,29 @@ function normalizeVideoMode(video: VideoMode | 'retry-with-video' | { mode: Vide
 }
 
 function shouldCaptureVideo(videoMode: VideoMode, testInfo: TestInfo) {
-  return (videoMode === 'on' || videoMode === 'retain-on-failure' || (videoMode === 'on-first-retry' && testInfo.retry === 1));
+  return videoMode === 'on'
+    || videoMode === 'retain-on-failure'
+    || videoMode === 'retain-on-failure-and-retries'
+    || (videoMode === 'on-first-retry' && testInfo.retry === 1)
+    || (videoMode === 'on-all-retries' && testInfo.retry > 0)
+    || (videoMode === 'retain-on-first-failure' && testInfo.retry === 0);
+}
+
+function shouldPreserveVideo(videoMode: VideoMode, testInfo: TestInfo) {
+  const testFailed = testInfo.status !== testInfo.expectedStatus;
+  switch (videoMode) {
+    case 'on':
+    case 'on-first-retry':
+    case 'on-all-retries':
+      return true;
+    case 'retain-on-failure':
+    case 'retain-on-first-failure':
+      return testFailed;
+    case 'retain-on-failure-and-retries':
+      return testFailed || testInfo.retry > 0;
+    default:
+      return false;
+  }
 }
 
 function normalizeScreenshotMode(screenshot: ScreenshotOption): ScreenshotMode {
@@ -734,7 +743,9 @@ class ArtifactsRecorder {
       await page._wrapApiCall(async () => {
         this._pageSnapshot = await page.ariaSnapshot({ mode: 'ai', timeout: 5000 });
       }, { internal: true });
-    } catch {}
+    } catch (error) {
+      debugLogger.log('error', `failed to capture aria snapshot: ${error}`);
+    }
   }
 
   async didCreateRequestContext(context: APIRequestContextImpl) {

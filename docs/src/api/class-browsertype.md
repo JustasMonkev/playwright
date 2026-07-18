@@ -153,6 +153,10 @@ Connecting over the Chrome DevTools Protocol is only supported for Chromium-base
 This connection is significantly lower fidelity than the Playwright protocol connection via [`method: BrowserType.connect`]. If you are experiencing issues or attempting to use advanced functionality, you probably want to use [`method: BrowserType.connect`].
 :::
 
+:::warning
+Playwright maintains a curated list of arguments for launching the browser. If you launch the browser without Playwright and do not pass the exact same arguments, some of Playwright functionality may be broken upon connecting to the browser.
+:::
+
 **Usage**
 
 ```js
@@ -235,6 +239,12 @@ emulation is not enabled, and media emulation options (such as [`option: Browser
 [`option: Browser.newContext.contrast`]) are not applied. Useful when attaching to a user's daily-driver
 browser where these overrides would interfere with existing browser state. New contexts created via
 [`method: Browser.newContext`] are not affected. Defaults to `false`.
+
+### option: BrowserType.connectOverCDP.artifactsDir
+* since: v1.61
+- `artifactsDir` <[path]>
+
+If specified, browser artifacts (such as traces and downloads) are saved into this directory.
 
 
 ## method: BrowserType.executablePath

@@ -15,8 +15,6 @@
 BrowserContext:
   type: interface
 
-  extends: EventTarget
-
   initializer:
     debugger: Debugger
     requestContext: APIRequestContext
@@ -157,6 +155,26 @@ BrowserContext:
               regexFlags: string?
               urlPattern: URLPattern?
 
+    routeAPIRequestsFromHar:
+      internal: true
+      parameters:
+        harId: string
+        urlGlob: string?
+        urlRegexSource: string?
+        urlRegexFlags: string?
+        notFound:
+          type: enum
+          literals:
+          - abort
+          - fallback
+      returns:
+        registrationId: string
+
+    unrouteAPIRequestsFromHar:
+      internal: true
+      parameters:
+        registrationId: string
+
     setWebSocketInterceptionPatterns:
       title: Route WebSockets
       group: route
@@ -181,6 +199,7 @@ BrowserContext:
       group: configuration
       parameters:
         indexedDB: boolean?
+        credentials: boolean?
       returns:
         cookies:
           type: array
@@ -188,6 +207,9 @@ BrowserContext:
         origins:
           type: array
           items: OriginStorage
+        credentials:
+          type: array?
+          items: VirtualCredential
 
     setStorageState:
       title: Set storage state
@@ -202,6 +224,9 @@ BrowserContext:
             origins:
               type: array?
               items: SetOriginStorage
+            credentials:
+              type: array?
+              items: VirtualCredential
 
     pause:
       title: Pause
@@ -314,6 +339,39 @@ BrowserContext:
       parameters:
         timeNumber: float?
         timeString: string?
+
+    credentialsInstall:
+      title: Install virtual WebAuthn authenticator
+      group: configuration
+
+    credentialsCreate:
+      title: Create virtual credential for "{rpId}"
+      group: configuration
+      parameters:
+        rpId: string
+        id: string?
+        userHandle: string?
+        privateKey: string?
+        publicKey: string?
+      returns:
+        credential: VirtualCredential
+
+    credentialsGet:
+      title: Get virtual credentials
+      group: configuration
+      parameters:
+        rpId: string?
+        id: string?
+      returns:
+        credentials:
+          type: array
+          items: VirtualCredential
+
+    credentialsDelete:
+      title: Delete virtual credential
+      group: configuration
+      parameters:
+        id: string
 
   events:
 

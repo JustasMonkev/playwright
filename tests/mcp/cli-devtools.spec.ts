@@ -216,7 +216,7 @@ test('tracing-start-stop', async ({ cli, server }, testInfo) => {
 
 test('video-start-stop', async ({ cli, server }) => {
   await cli('open', server.HELLO_WORLD);
-  const { output: videoStartOutput } = await cli('video-start', 'video.webm', '--size=400x300');
+  const { output: videoStartOutput } = await cli('video-start', 'recordings/video.webm', '--size=400x300');
   expect(videoStartOutput).toContain('Video recording started.');
   const { output: tabNewOutput } = await cli('tab-new');
   expect(tabNewOutput).toContain('1: (current) [](about:blank)');
@@ -225,7 +225,7 @@ test('video-start-stop', async ({ cli, server }) => {
   const { output: tabCloseOutput } = await cli('tab-close');
   expect(tabCloseOutput).toContain(`0: (current) [](${server.EMPTY_PAGE})`);
   const { output: videoStopOutput } = await cli('video-stop');
-  expect(videoStopOutput).toContain(`### Result\n- [Video](./video.webm)\n- [Video](./video-1.webm)`);
+  expect(videoStopOutput).toContain(`### Result\n- [Video](recordings${path.sep}video.webm)\n- [Video](recordings${path.sep}video-1.webm)`);
 });
 
 test('video-chapter', async ({ cli, server }) => {
@@ -234,6 +234,21 @@ test('video-chapter', async ({ cli, server }) => {
   const { output } = await cli('video-chapter', 'Introduction', '--description=Welcome to the demo', '--duration=100');
   expect(output).toContain(`Chapter 'Introduction' added.`);
   await cli('video-stop');
+});
+
+test('video-show-actions and video-hide-actions', async ({ cli, server }) => {
+  await cli('open', server.HELLO_WORLD);
+  const { output: showOutput } = await cli('video-show-actions', '--duration=200', '--position=bottom-right');
+  expect(showOutput).toContain('Action annotations enabled.');
+  const { output: hideOutput } = await cli('video-hide-actions');
+  expect(hideOutput).toContain('Action annotations disabled.');
+});
+
+test('video-show-actions rejects invalid position', async ({ cli, server }) => {
+  await cli('open', server.HELLO_WORLD);
+  const { error, exitCode } = await cli('video-show-actions', '--position=middle');
+  expect(exitCode).not.toBe(0);
+  expect(error).toContain('position');
 });
 
 test('generate-locator', async ({ cli, server }) => {
