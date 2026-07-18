@@ -84,6 +84,7 @@ export type TabHeader = {
 
 type PdfDocument = {
   url: string;
+  method: string;
   // Set when the tab showed an application page before the PDF navigation replaced it.
   canRestore: boolean;
   // Set for documents that never hit the network (blob: and data: urls).
@@ -110,7 +111,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   crashed = false;
   private _modalStates: ModalState[] = [];
   private _pdf: PdfDocument | undefined;
-  private _mainFrameUrl: string = 'about:blank';
+  private _mainFrameUrl: string;
   private _initializedPromise: Promise<void>;
   private _recentEventEntries: EventEntry[] = [];
   private _consoleLog: LogFile;
@@ -124,6 +125,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     this.context = context;
     this.page = page;
     this._onPageClose = onPageClose;
+    // Existing pages (e.g. when attaching to a running browser) never emit an
+    // initial framenavigated event, so seed the url from the page itself.
+    this._mainFrameUrl = page.url();
     const p = page;
     this._disposables = [
       eventsHelper.addEventListener(p, 'console', event => this._handleConsoleMessage(messageToConsoleMessage(event))),
@@ -272,10 +276,20 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     if (!response.request().isNavigationRequest() || response.frame() !== this.page.mainFrame())
       return;
     const contentType = response.headers()['content-type'] ?? '';
-    if (contentType.includes('application/pdf'))
-      this._pdf = { url: response.url(), canRestore: this._mainFrameUrl !== 'about:blank' };
+    // Attachments trigger a download instead of committing a navigation.
+    const disposition = response.headers()['content-disposition'] ?? '';
+    if (contentType.includes('application/pdf') && !disposition.toLowerCase().startsWith('attachment'))
+      this._pdf = { url: response.url(), method: response.request().method(), canRestore: this._mainFrameUrl !== 'about:blank' };
     else
       this._pdf = undefined;
+  }
+
+  // A PDF response that never committed (e.g. one that triggered a download)
+  // leaves the page on its previous url - drop the stale record.
+  private _currentPdf(): PdfDocument | undefined {
+    if (this._pdf && this.page.url() !== this._pdf.url)
+      this._pdf = undefined;
+    return this._pdf;
   }
 
   private _handleFrameNavigated(frame: playwright.Frame) {
@@ -290,14 +304,26 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   }
 
   async ensurePdfInNewTab(): Promise<void> {
-    const pdf = this._pdf;
+    const pdf = this._currentPdf();
     if (!pdf?.canRestore)
+      return;
+    // Re-opening the document issues a fresh GET, so leave the results of
+    // non-idempotent requests (e.g. POST form submissions) in place.
+    if (pdf.method !== 'GET')
       return;
     // Keep the application page in this tab and move the PDF into a tab of its
     // own, so that closing the PDF leaves the application unaffected.
     const newTab = await this.context.newTab();
-    await this.page.goBack(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
     await newTab.page.goto(pdf.url, { waitUntil: 'domcontentloaded', ...this.navigationTimeoutOptions }).catch(e => debug('pw:tools:error')(e));
+    // Only give up this tab's copy once the new tab shows the same document.
+    if (newTab._currentPdf()?.url === pdf.url)
+      await this.page.goBack(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
+    if (this.page.url() === pdf.url) {
+      // The application page could not be restored (e.g. the PDF replaced its
+      // history entry), so keep the PDF here and drop the extra tab.
+      await newTab.page.close().catch(e => debug('pw:tools:error')(e));
+      return;
+    }
     await newTab.waitForLoadState('load', { timeout: 5000 });
   }
 
@@ -460,12 +486,13 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     let tabSnapshot: TabSnapshot | undefined;
     const modalStates = await this._raceAgainstModalStates(async () => {
       await this._detectLocalPdfDocument();
-      if (this._pdf) {
+      const pdf = this._currentPdf();
+      if (pdf) {
         tabSnapshot = {
           ariaSnapshot: '',
           modalStates: [],
           events: [],
-          pdf: await this._capturePdf(this._pdf),
+          pdf: await this._capturePdf(pdf),
         };
         return;
       }
@@ -500,7 +527,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       return;
     const contentType = await this.page.evaluate(() => document.contentType).catch(() => undefined);
     if (contentType === 'application/pdf' && this.page.url() === url)
-      this._pdf = { url, canRestore: false, local: true };
+      this._pdf = { url, method: 'GET', canRestore: false, local: true };
   }
 
   private async _capturePdf(pdf: PdfDocument): Promise<{ url: string, file?: string }> {

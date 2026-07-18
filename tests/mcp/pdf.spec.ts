@@ -218,6 +218,68 @@ test('pdf opened from a blob url is detected and read', async ({ startClient, mc
   });
 });
 
+test('pdf produced by a form post stays in the same tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/app', `
+    <title>App</title>
+    <form method="post" action="${server.PREFIX}/report.pdf">
+      <button type="submit">Generate report</button>
+    </form>
+  `, 'text/html');
+  server.setRoute('/report.pdf', (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/pdf' });
+    res.end('%PDF-1.4 post result');
+  });
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  const navigateResponse = await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/app' },
+  });
+  const ref = parseResponse(navigateResponse, testInfo.outputPath()).snapshot.match(/button "Generate report".*\[ref=(e\d+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+
+  // The POST result cannot be reproduced by a fresh GET, so the PDF is kept in place.
+  expect(await client.callTool({
+    name: 'browser_click',
+    arguments: { element: 'Generate report button', target: ref },
+  })).toHaveResponse({
+    tabs: undefined,
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/report.pdf`),
+  });
+});
+
+test('pdf attachment triggers a download instead of a pdf tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'Behavior is only deterministic in Chromium.');
+  server.setRoute('/attachment.pdf', (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': 'attachment; filename="attachment.pdf"' });
+    res.end('%PDF-1.4 attachment');
+  });
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.HELLO_WORLD },
+  });
+
+  const response = await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/attachment.pdf' },
+  });
+  expect(parseResponse(response, testInfo.outputPath()).text).not.toContain('PDF document');
+
+  // The tab still shows the application page.
+  expect(await client.callTool({
+    name: 'browser_snapshot',
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('Hello, world!'),
+  });
+});
+
 test('navigating to a pdf in a fresh tab keeps a single tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   const { client } = await startClient({

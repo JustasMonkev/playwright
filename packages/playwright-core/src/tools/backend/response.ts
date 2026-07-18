@@ -287,10 +287,13 @@ export class Response {
     if (tabSnapshot && this._includeSnapshot !== 'none') {
       if (tabSnapshot.pdf) {
         const lines = [`- PDF document: ${tabSnapshot.pdf.url}`];
-        if (tabSnapshot.pdf.file)
+        if (tabSnapshot.pdf.file) {
+          // Exempt from the output budget cleanup, like other files of this response.
+          this._writtenFiles.add(path.resolve(tabSnapshot.pdf.file));
           lines.push(`- [PDF content](${this._computeRelativeTo(tabSnapshot.pdf.file)})`);
-        else
+        } else {
           lines.push(`- Failed to read the PDF content.`);
+        }
         if (this._context.tabs().length > 1)
           lines.push(`- The PDF is open in its own tab. Close the tab when done to return to the application.`);
         addSection('Snapshot', lines);
