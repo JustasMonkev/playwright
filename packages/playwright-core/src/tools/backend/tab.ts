@@ -92,6 +92,7 @@ type PdfDocument = {
   route?: RouteEntry;
   // Set for documents that never hit the network (blob: and data: urls).
   local?: boolean;
+  moveAttempted?: boolean;
   file?: string;
 };
 
@@ -330,7 +331,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
 
   async ensurePdfInNewTab(restoreDirection: 'back' | 'forward' = 'back'): Promise<void> {
     const pdf = this._currentPdf();
-    if (!pdf?.restoreUrl)
+    if (!pdf?.restoreUrl || pdf.moveAttempted)
       return;
     // Blob and data documents only resolve in the tab that owns them and
     // cannot be reproduced in another tab.
@@ -340,12 +341,14 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     // non-idempotent requests (e.g. POST form submissions) in place.
     if (pdf.method !== 'GET')
       return;
+    pdf.moveAttempted = true;
     // Keep the application page in this tab and move the PDF into a tab of its
     // own, so that closing the PDF leaves the application unaffected.
     // _currentPdf() guarantees the page url is the same document, and unlike
     // the response url it keeps the fragment (e.g. #page=2).
     const pdfUrl = this.page.url();
     const newTab = await this.context.newTab();
+    this.context.setTabCloseTarget(newTab, this);
     await newTab._initializedPromise.catch(e => debug('pw:tools:error')(e));
     await newTab.page.goto(pdfUrl, { waitUntil: 'domcontentloaded', ...this.navigationTimeoutOptions }).catch(e => debug('pw:tools:error')(e));
     // Only give up this tab's copy once the new tab shows the same document.
@@ -366,6 +369,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         else
           await this.page.goForward(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
       }
+      const currentPdf = this._currentPdf();
+      if (currentPdf)
+        currentPdf.moveAttempted = true;
       await newTab.page.close().catch(e => debug('pw:tools:error')(e));
       return;
     }
@@ -636,7 +642,12 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         this._checkPdfSize(data.length);
         return data;
       }
-      const response = await this.page.request.get(url, { maxRedirects: 0, headers: route?.addHeaders });
+      const headers = redirects === 0 && pdf.response ? await pdf.response.request().allHeaders() : {};
+      for (const [name, value] of Object.entries(route?.addHeaders ?? {}))
+        headers[name.toLowerCase()] = value;
+      for (const name of route?.removeHeaders ?? [])
+        headers[name.toLowerCase()] = '';
+      const response = await this.page.request.get(url, { maxRedirects: 0, headers });
       try {
         const location = response.headers()['location'];
         if (response.status() >= 300 && response.status() < 400 && location) {
@@ -670,16 +681,21 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   }
 
   private async _fetchPdfInPage(url: string): Promise<Buffer> {
-    const base64 = await this.page.evaluate(async url => {
+    const maxSize = this.context.config.outputMaxSize;
+    const base64 = await this.page.evaluate(async ({ url, maxSize }) => {
       const response = await fetch(url);
       const bytes = new Uint8Array(await response.arrayBuffer());
+      if (maxSize && bytes.length > maxSize)
+        throw new Error(`Failed to read the PDF content: ${bytes.length} bytes exceeds the configured outputMaxSize of ${maxSize} bytes.`);
       let binary = '';
       const chunkSize = 0x8000;
       for (let i = 0; i < bytes.length; i += chunkSize)
         binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
       return btoa(binary);
-    }, url);
-    return Buffer.from(base64, 'base64');
+    }, { url, maxSize });
+    const data = Buffer.from(base64, 'base64');
+    this._checkPdfSize(data.length);
+    return data;
   }
 
   private _javaScriptBlocked(): boolean {

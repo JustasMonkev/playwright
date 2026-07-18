@@ -218,6 +218,20 @@ test('pdf opened from a blob url is detected and read', async ({ startClient, mc
   });
 });
 
+test('local pdf capture respects outputMaxSize', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({ config: { outputDir, outputMaxSize: 10 } });
+
+  const response = await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: 'data:application/pdf;base64,' + Buffer.from('%PDF-1.4 oversized').toString('base64') },
+  });
+
+  expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('exceeds the configured outputMaxSize');
+  expect(fs.existsSync(outputDir) ? fs.readdirSync(outputDir).filter(file => file.endsWith('.pdf')) : []).toHaveLength(0);
+});
+
 test('pdf produced by a form post stays in the same tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   server.setContent('/app', `
@@ -372,6 +386,66 @@ test('pdf fulfilled by browser_route saves the routed bytes', async ({ startClie
     arguments: { action: 'new', url: server.PREFIX + '/header.pdf' },
   });
   expect(fs.readFileSync(path.join(outputDir, 'header.pdf'), 'utf8')).toBe('%PDF-1.4 header');
+});
+
+test('pdf refetch preserves navigation headers and route removals', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/app', '<a href="/header-sensitive.pdf">Open PDF</a>', 'text/html');
+  server.setExtraHeaders('/app', { 'Set-Cookie': 'unwanted=yes; Path=/' });
+  server.setRoute('/header-sensitive.pdf', (req, res) => {
+    if (req.headers.cookie || req.headers.referer !== server.PREFIX + '/app') {
+      res.writeHead(400, { 'Content-Type': 'text/html' });
+      res.end('wrong headers');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/pdf' });
+    res.end('%PDF-1.4 header sensitive');
+  });
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({ config: { outputDir, capabilities: ['network'] } });
+
+  await client.callTool({ name: 'browser_route', arguments: { pattern: '**/header-sensitive.pdf', removeHeaders: 'cookie' } });
+  const navigateResponse = await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/app' } });
+  const ref = parseResponse(navigateResponse, testInfo.outputPath()).snapshot.match(/link "Open PDF".*\[ref=(e\d+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+  await client.callTool({ name: 'browser_click', arguments: { element: 'Open PDF link', target: ref } });
+
+  expect(fs.readFileSync(path.join(outputDir, 'header-sensitive.pdf'), 'utf8')).toBe('%PDF-1.4 header sensitive');
+});
+
+test('closing a moved pdf returns to its source tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/source', '<title>Source</title><a href="/empty.pdf">Open PDF</a>', 'text/html');
+  server.setContent('/unrelated', '<title>Unrelated</title><body>Unrelated tab</body>', 'text/html');
+  const { client } = await startClient({ config: { outputDir: testInfo.outputPath('output') } });
+
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/source' } });
+  await client.callTool({ name: 'browser_tabs', arguments: { action: 'new', url: server.PREFIX + '/unrelated' } });
+  await client.callTool({ name: 'browser_tabs', arguments: { action: 'select', index: 0 } });
+  const sourceResponse = await client.callTool({ name: 'browser_snapshot' });
+  const ref = parseResponse(sourceResponse, testInfo.outputPath()).inlineSnapshot.match(/link "Open PDF".*\[ref=(e\d+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+  await client.callTool({ name: 'browser_click', arguments: { element: 'Open PDF link', target: ref } });
+  await client.callTool({ name: 'browser_tabs', arguments: { action: 'close' } });
+
+  expect(await client.callTool({ name: 'browser_snapshot' })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('Open PDF'),
+  });
+});
+
+test('delayed pdf navigation moves the pdf when the next response is built', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/app', '<button onclick="setTimeout(() => location.href = \'/empty.pdf\', 1000)">Open PDF later</button>', 'text/html');
+  const { client } = await startClient({ config: { outputDir: testInfo.outputPath('output') } });
+
+  const navigateResponse = await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/app' } });
+  const ref = parseResponse(navigateResponse, testInfo.outputPath()).snapshot.match(/button "Open PDF later".*\[ref=(e\d+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+  await client.callTool({ name: 'browser_click', arguments: { element: 'Open PDF later button', target: ref } });
+  expect(await client.callTool({ name: 'browser_wait_for', arguments: { time: 2 } })).toHaveResponse({
+    tabs: expect.stringContaining('1: (current)'),
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/empty.pdf`),
+  });
 });
 
 test('failed pdf refetch is reported', async ({ startClient, mcpBrowser, server }, testInfo) => {

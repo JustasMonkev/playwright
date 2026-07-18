@@ -99,6 +99,7 @@ export class Context {
   private _tabs: Tab[] = [];
   private _currentTab: Tab | undefined;
   private _routes: RouteEntry[] = [];
+  private _tabCloseTargets = new WeakMap<Tab, Tab>();
   private _video: {
     params: VideoParams;
     fileNames: string[];
@@ -179,6 +180,10 @@ export class Context {
     return tab;
   }
 
+  setTabCloseTarget(tab: Tab, target: Tab) {
+    this._tabCloseTargets.set(tab, target);
+  }
+
   async ensureTab(): Promise<Tab> {
     await this.ensureBrowserContext();
     const crashed = this._currentTab?.crashed;
@@ -257,10 +262,13 @@ export class Context {
     const index = this._tabs.indexOf(tab);
     if (index === -1)
       return;
+    const closeTarget = this._tabCloseTargets.get(tab);
     this._tabs.splice(index, 1);
 
-    if (this._currentTab === tab)
-      this._currentTab = this._tabs[Math.min(index, this._tabs.length - 1)];
+    if (this._currentTab === tab) {
+      this._currentTab = closeTarget && this._tabs.includes(closeTarget) ? closeTarget : this._tabs[Math.min(index, this._tabs.length - 1)];
+      this._currentTab?.page.bringToFront().catch(() => {});
+    }
   }
 
   routes(): RouteEntry[] {
