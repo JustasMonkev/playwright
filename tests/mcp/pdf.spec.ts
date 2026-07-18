@@ -164,6 +164,60 @@ test('clicking a link to a pdf opens it in a new tab', async ({ startClient, mcp
   });
 });
 
+test('pdf opened from a blob url is detected and read', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setContent('/app', `
+    <title>App</title>
+    <button onclick="window.open(window.URL.createObjectURL(new Blob(['%PDF-1.4 blob content'], { type: 'application/pdf' })))">Print</button>
+  `, 'text/html');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  const navigateResponse = await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/app' },
+  });
+  const ref = parseResponse(navigateResponse, testInfo.outputPath()).snapshot.match(/button "Print".*\[ref=(e\d+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+
+  expect(await client.callTool({
+    name: 'browser_click',
+    arguments: { element: 'Print button', target: ref },
+  })).toHaveResponse({
+    tabs: expect.stringContaining('blob:'),
+  });
+
+  expect(await client.callTool({
+    name: 'browser_tabs',
+    arguments: { action: 'select', index: 1 },
+  })).toHaveResponse({
+    result: expect.stringContaining('1: (current)'),
+  });
+
+  expect(await client.callTool({
+    name: 'browser_snapshot',
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('- PDF document: blob:'),
+  });
+
+  const pdfFiles = fs.readdirSync(testInfo.outputPath('output')).filter(f => f.endsWith('.pdf'));
+  expect(pdfFiles).toHaveLength(1);
+  expect(fs.readFileSync(testInfo.outputPath('output', pdfFiles[0]), 'utf-8')).toBe('%PDF-1.4 blob content');
+
+  // Closing the PDF tab returns to the application.
+  await client.callTool({
+    name: 'browser_tabs',
+    arguments: { action: 'close', index: 1 },
+  });
+
+  expect(await client.callTool({
+    name: 'browser_snapshot',
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('Print'),
+  });
+});
+
 test('navigating to a pdf in a fresh tab keeps a single tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   const { client } = await startClient({

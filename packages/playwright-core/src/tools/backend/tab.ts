@@ -86,6 +86,8 @@ type PdfDocument = {
   url: string;
   // Set when the tab showed an application page before the PDF navigation replaced it.
   canRestore: boolean;
+  // Set for documents that never hit the network (blob: and data: urls).
+  local?: boolean;
   file?: string;
 };
 
@@ -457,6 +459,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     await this._initializedPromise;
     let tabSnapshot: TabSnapshot | undefined;
     const modalStates = await this._raceAgainstModalStates(async () => {
+      await this._detectLocalPdfDocument();
       if (this._pdf) {
         tabSnapshot = {
           ariaSnapshot: '',
@@ -488,13 +491,26 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     };
   }
 
+  // Blob and data urls never produce network responses, so probe the document itself.
+  private async _detectLocalPdfDocument() {
+    if (this._pdf)
+      return;
+    const url = this.page.url();
+    if (!url.startsWith('blob:') && !url.startsWith('data:'))
+      return;
+    const contentType = await this.page.evaluate(() => document.contentType).catch(() => undefined);
+    if (contentType === 'application/pdf' && this.page.url() === url)
+      this._pdf = { url, canRestore: false, local: true };
+  }
+
   private async _capturePdf(pdf: PdfDocument): Promise<{ url: string, file?: string }> {
     if (!pdf.file) {
       try {
         // The navigation response body is the built-in PDF viewer in Chromium,
         // so re-fetch the document with the page credentials instead.
-        const response = await this.page.request.get(pdf.url);
-        const data = await response.body();
+        const data = pdf.local
+          ? await this._fetchPdfInPage(pdf.url)
+          : await this.page.request.get(pdf.url).then(response => response.body());
         const file = await this.context.outputFile({ prefix: 'pdf', ext: 'pdf', suggestedFilename: suggestedPdfFilename(pdf.url) }, { origin: 'code' });
         await fs.promises.writeFile(file, data);
         pdf.file = file;
@@ -503,6 +519,19 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       }
     }
     return { url: pdf.url, file: pdf.file };
+  }
+
+  private async _fetchPdfInPage(url: string): Promise<Buffer> {
+    const base64 = await this.page.evaluate(async url => {
+      const response = await fetch(url);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      let binary = '';
+      const chunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunkSize)
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+      return btoa(binary);
+    }, url);
+    return Buffer.from(base64, 'base64');
   }
 
   private _javaScriptBlocked(): boolean {
