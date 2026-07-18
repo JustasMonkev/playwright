@@ -30,7 +30,7 @@ import { handleDialog } from './dialogs';
 import { uploadFile } from './files';
 
 import type { Disposable } from '@isomorphic/disposable';
-import type { Context, ContextConfig } from './context';
+import type { Context, ContextConfig, RouteEntry } from './context';
 import type * as playwright from '../../..';
 
 const TabEvents = {
@@ -88,6 +88,8 @@ type PdfDocument = {
   method: string;
   // The application page displaced by this PDF navigation, when restorable.
   restoreUrl?: string;
+  response?: playwright.Response;
+  route?: RouteEntry;
   // Set for documents that never hit the network (blob: and data: urls).
   local?: boolean;
   file?: string;
@@ -290,8 +292,8 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     // Attachments trigger a download instead of committing a navigation.
     const disposition = response.headers()['content-disposition'] ?? '';
     if (isPdfContentType(contentType) && !disposition.toLowerCase().startsWith('attachment')) {
-      const restoreUrl = this._restoreUrl(this._mainFrameUrl, response.url());
-      this._pdf = { url: response.url(), method: response.request().method(), restoreUrl };
+      const restoreUrl = this._restoreUrl(this._mainFrameUrl);
+      this._pdf = { url: response.url(), method: response.request().method(), restoreUrl, response, route: this.context.matchingRoute(response.url()) };
     } else {
       this._pdf = undefined;
     }
@@ -300,8 +302,8 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   // There is an application page to restore only when the PDF displaced a real
   // page at a different url - a same-url replacement (e.g. a reload that now
   // serves a PDF) consumed the application's history entry.
-  private _restoreUrl(previousUrl: string, pdfUrl: string): string | undefined {
-    return previousUrl !== 'about:blank' && urlWithoutFragment(previousUrl) !== urlWithoutFragment(pdfUrl) ? previousUrl : undefined;
+  private _restoreUrl(previousUrl: string): string | undefined {
+    return previousUrl !== 'about:blank' ? previousUrl : undefined;
   }
 
   // A PDF response that never committed (e.g. one that triggered a download)
@@ -355,7 +357,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       else
         await this.page.goBack(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
     }
-    if (!this._restoredFromPdf(pdf)) {
+    if (!await this._restoredFromPdf(pdf)) {
       // The application page could not be restored (e.g. the PDF replaced its
       // history entry), so return to the PDF and drop the extra tab.
       if (urlWithoutFragment(this.page.url()) !== urlWithoutFragment(pdf.url)) {
@@ -371,8 +373,11 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     await newTab.page.waitForLoadState('load', { timeout: 5000 }).catch(e => debug('pw:tools:error')(e));
   }
 
-  private _restoredFromPdf(pdf: PdfDocument): boolean {
-    return !!pdf.restoreUrl && urlWithoutFragment(this.page.url()) === urlWithoutFragment(pdf.restoreUrl);
+  private async _restoredFromPdf(pdf: PdfDocument): Promise<boolean> {
+    if (!pdf.restoreUrl || urlWithoutFragment(this.page.url()) !== urlWithoutFragment(pdf.restoreUrl))
+      return false;
+    const contentType = await this.page.evaluate(() => document.contentType).catch(() => undefined);
+    return contentType !== undefined && !isPdfContentType(contentType);
   }
 
   private _handleRequestFailed(request: playwright.Request) {
@@ -579,7 +584,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     const contentType = await this.page.evaluate(() => document.contentType).catch(() => undefined);
     if (contentType === 'application/pdf' && this.page.url() === url) {
       const local = url.startsWith('blob:') || url.startsWith('data:');
-      const restoreUrl = this._restoreUrl(this._previousMainFrameUrl, url);
+      const restoreUrl = this._restoreUrl(this._previousMainFrameUrl);
       this._pdf = { url, method: 'GET', restoreUrl, local };
     }
   }
@@ -596,7 +601,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       try {
         // The navigation response body is the built-in PDF viewer in Chromium,
         // so re-fetch the document with the page credentials instead.
-        const data = pdf.local ? await this._fetchPdfInPage(pdf.url) : await this._fetchPdf(pdf.url);
+        const data = pdf.local ? await this._fetchPdfInPage(pdf.url) : await this._fetchPdf(pdf);
         const suggestedFilename = suggestedPdfFilename(pdf.url);
         let file = await this.context.outputFile({ prefix: 'pdf', ext: 'pdf', suggestedFilename }, { origin: 'code' });
         try {
@@ -617,10 +622,21 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     return { url: pdf.url, file: pdf.file, dedicatedTab };
   }
 
-  private async _fetchPdf(url: string): Promise<Buffer> {
+  private async _fetchPdf(pdf: PdfDocument): Promise<Buffer> {
+    if (pdf.response?.fromServiceWorker())
+      throw new Error('Failed to read the PDF content: the document was served by a service worker and cannot be safely re-fetched.');
+    let url = pdf.url;
     for (let redirects = 0; redirects <= 20; redirects++) {
       this.context.checkNetworkUrlAllowed(url);
-      const response = await this.page.request.get(url, { maxRedirects: 0 });
+      const route = redirects === 0 ? pdf.route : this.context.matchingRoute(url);
+      if (route && (route.body !== undefined || route.status !== undefined)) {
+        if (pdf.response && !pdf.response.ok())
+          throw new Error(`Failed to read the PDF content: HTTP ${pdf.response.status()} ${pdf.response.statusText()}.`);
+        const data = Buffer.from(route.body ?? '');
+        this._checkPdfSize(data.length);
+        return data;
+      }
+      const response = await this.page.request.get(url, { maxRedirects: 0, headers: route?.addHeaders });
       try {
         const location = response.headers()['location'];
         if (response.status() >= 300 && response.status() < 400 && location) {
@@ -631,12 +647,26 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           throw new Error(`Failed to read the PDF content: HTTP ${response.status()} ${response.statusText()}.`);
         if (!isPdfContentType(response.headers()['content-type'] ?? ''))
           throw new Error(`Failed to read the PDF content: expected application/pdf, received ${response.headers()['content-type'] || 'no content type'}.`);
-        return await response.body();
+        const contentLength = Number(response.headers()['content-length']);
+        this._checkPdfSize(Number.isSafeInteger(contentLength) && contentLength >= 0 ? contentLength : undefined);
+        const data = await response.body();
+        this._checkPdfSize(data.length);
+        return data;
       } finally {
         await response.dispose();
       }
     }
     throw new Error('Failed to read the PDF content: too many redirects.');
+  }
+
+  private _checkPdfSize(size: number | undefined) {
+    const maxSize = this.context.config.outputMaxSize;
+    if (!maxSize)
+      return;
+    if (size === undefined)
+      throw new Error('Failed to read the PDF content: the response has no valid content-length within the configured outputMaxSize.');
+    if (size > maxSize)
+      throw new Error(`Failed to read the PDF content: ${size} bytes exceeds the configured outputMaxSize of ${maxSize} bytes.`);
   }
 
   private async _fetchPdfInPage(url: string): Promise<Buffer> {

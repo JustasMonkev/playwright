@@ -332,6 +332,48 @@ test('pdf artifacts with the same basename use separate files', async ({ startCl
   expect(pdfContents).toHaveLength(2);
 });
 
+test('pdf fulfilled by browser_route saves the routed bytes', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setRoute('/header.pdf', (req, res) => {
+    if (req.headers['x-pdf-route'] !== 'enabled') {
+      res.writeHead(404, { 'Content-Type': 'text/html' });
+      res.end('missing header');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/pdf' });
+    res.end('%PDF-1.4 header');
+  });
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({ config: { outputDir, capabilities: ['network'] } });
+
+  await client.callTool({
+    name: 'browser_route',
+    arguments: {
+      pattern: '**/routed.pdf',
+      status: 200,
+      body: '%PDF-1.4 routed',
+      contentType: 'application/pdf',
+    },
+  });
+  expect(await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/routed.pdf' },
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/routed.pdf`),
+  });
+  expect(fs.readFileSync(path.join(outputDir, 'routed.pdf'), 'utf8')).toBe('%PDF-1.4 routed');
+
+  await client.callTool({
+    name: 'browser_route',
+    arguments: { pattern: '**/header.pdf', headers: ['X-PDF-Route: enabled'] },
+  });
+  await client.callTool({
+    name: 'browser_tabs',
+    arguments: { action: 'new', url: server.PREFIX + '/header.pdf' },
+  });
+  expect(fs.readFileSync(path.join(outputDir, 'header.pdf'), 'utf8')).toBe('%PDF-1.4 header');
+});
+
 test('failed pdf refetch is reported', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   let requests = 0;
@@ -417,6 +459,54 @@ test('pdf reached with location.replace stays in the original tab', async ({ sta
   });
 });
 
+test('same-url pdf restoration is attempted and verified', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  let reportRequests = 0;
+  server.setRoute('/report', (req, res) => {
+    if (++reportRequests === 1) {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<a href="/redirect">Open PDF</a>');
+    } else {
+      res.writeHead(200, { 'Content-Type': 'application/pdf' });
+      res.end('%PDF-1.4 same url');
+    }
+  });
+  server.setRedirect('/redirect', server.PREFIX + '/report');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  const appResponse = await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/report' } });
+  const ref = parseResponse(appResponse, testInfo.outputPath()).snapshot.match(/link "Open PDF".*\[ref=([^\]]+)\]/)?.[1];
+  expect(ref).toBeTruthy();
+  const pdfResponse = await client.callTool({
+    name: 'browser_click',
+    arguments: { element: 'Open PDF link', target: ref },
+  });
+  expect(pdfResponse).toHaveResponse({
+    tabs: undefined,
+    inlineSnapshot: expect.stringContaining(`- PDF document: ${server.PREFIX}/report`),
+  });
+  // Chromium re-fetches this same-url history entry as a PDF, so verification
+  // keeps the original tab. The extra request proves restoration was attempted.
+  expect(parseResponse(pdfResponse, testInfo.outputPath()).inlineSnapshot).not.toContain('own tab');
+  expect(reportRequests).toBe(4);
+});
+
+test('pdf capture respects outputMaxSize before buffering', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  server.setRoute('/large.pdf', (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': '100' });
+    res.end(Buffer.alloc(100));
+  });
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({ config: { outputDir, outputMaxSize: 10 } });
+
+  const response = await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/large.pdf' } });
+  expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('exceeds the configured outputMaxSize');
+  expect(fs.existsSync(outputDir) ? fs.readdirSync(outputDir).filter(file => file.endsWith('.pdf')) : []).toHaveLength(0);
+});
+
 test('navigating back to a pdf in history moves it to a new tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   const { client } = await startClient({
@@ -491,8 +581,10 @@ test('pdf opened in the same tab via a blob url stays there', async ({ startClie
 
 test('pdf survives the output budget cleanup', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const pdfSize = fs.statSync(path.join(__dirname, '../assets/empty.pdf')).size;
+  server.setExtraHeaders('/empty.pdf', { 'Content-Length': String(pdfSize) });
   const { client } = await startClient({
-    config: { outputDir: testInfo.outputPath('output'), outputMaxSize: 1 },
+    config: { outputDir: testInfo.outputPath('output'), outputMaxSize: pdfSize },
   });
 
   await client.callTool({

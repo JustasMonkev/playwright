@@ -267,6 +267,13 @@ export class Context {
     return this._routes;
   }
 
+  matchingRoute(url: string): RouteEntry | undefined {
+    for (let i = this._routes.length - 1; i >= 0; i--) {
+      if (urlMatches(undefined, url, this._routes[i].pattern))
+        return this._routes[i];
+    }
+  }
+
   async addRoute(entry: RouteEntry): Promise<void> {
     const browserContext = await this.ensureBrowserContext();
     await browserContext.route(entry.pattern, entry.handler);
