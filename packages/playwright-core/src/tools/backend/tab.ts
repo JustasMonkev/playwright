@@ -480,11 +480,6 @@ export class Tab extends EventEmitter<TabEventsInterface> {
 
   async navigate(url: string) {
     await this._initializedPromise;
-
-    // An explicit navigation repurposes a generated PDF tab, so closing the
-    // resulting page should follow normal tab adjacency.
-    this.context.clearTabCloseTarget(this);
-
     this._clearCollectedArtifacts();
 
     const { promise: downloadEvent, abort: abortDownloadEvent } = eventWaiter<playwright.Download>(this.page, 'download', 3000);
@@ -664,6 +659,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       this.context.checkNetworkUrlAllowed(pdf.url);
     throwIfAborted(signal);
     const requestHeaders = pdf.response ? await pdf.response.request().allHeaders() : {};
+    const hasOriginalCookieHeader = Object.keys(requestHeaders).some(name => name.toLowerCase() === 'cookie');
     const originalReferrer = requestHeaders['referer'];
     const sameOriginReferrer = originalReferrer && sameOrigin(originalReferrer, this.page.url()) ? originalReferrer : undefined;
     let blockedUrl: string | undefined;
@@ -682,9 +678,13 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         return;
       await fileHandle.write(Buffer.from(base64, 'base64'));
     });
+    if (signal?.aborted)
+      throwIfAborted(signal);
     const cdpSession = !pdf.local ? await this.page.context().newCDPSession(this.page) : undefined;
     if (cdpSession) {
       await cdpSession.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+      if (signal?.aborted)
+        throwIfAborted(signal);
       cdpSession.on('Fetch.requestPaused', event => {
         if (!pdfNetworkId && (event.resourceType === 'XHR' || event.resourceType === 'Fetch') && urlWithoutFragment(event.request.url) === urlWithoutFragment(pdf.url))
           pdfNetworkId = event.networkId;
@@ -703,12 +703,12 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           const mergedHeaders = new Map(Object.entries(event.request.headers).map(([name, value]) => [name.toLowerCase(), { name, value: String(value) }]));
           for (const [name, value] of Object.entries(requestHeaders)) {
             const lowerName = name.toLowerCase();
-            if (lowerName === 'cookie')
-              continue;
             if (!isReusablePdfRequestHeader(lowerName))
               continue;
             mergedHeaders.set(lowerName, { name, value });
           }
+          if (!hasOriginalCookieHeader)
+            mergedHeaders.delete('cookie');
           if (originalReferrer && !sameOriginReferrer)
             mergedHeaders.set('referer', { name: 'Referer', value: originalReferrer });
           headers = [...mergedHeaders.values()];
@@ -726,6 +726,8 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     }, cancelBindingName).catch(() => {});
     let onAbort: (() => void) | undefined;
     const abortPromise = signal ? new Promise<never>((_, reject) => {
+      if (signal?.aborted)
+        throwIfAborted(signal);
       onAbort = () => {
         void cancelPdfRequest();
         reject(signal.reason instanceof Error ? signal.reason : new Error('The PDF refetch operation was aborted'));
@@ -800,16 +802,12 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       if (!isPdfContentType(result.contentType))
         throw new Error(`Failed to read the PDF content: expected application/pdf, received ${result.contentType || 'no content type'}.`);
     } catch (error) {
-      if (blockedUrl)
-        this.context.checkNetworkUrlAllowed(blockedUrl);
       throw error;
     } finally {
       if (signal && onAbort)
         signal.removeEventListener('abort', onAbort);
       if (timeoutHandle)
         clearTimeout(timeoutHandle);
-      if (blockedUrl)
-        this.context.checkNetworkUrlAllowed(blockedUrl);
       await chunkBinding.dispose().catch(() => {});
       this.page.off('request', requestListener);
       this._requests = this._requests.filter(request => !internalRequests.has(request));
