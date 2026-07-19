@@ -292,16 +292,26 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     const contentType = response.headers()['content-type'] ?? '';
     // Attachments trigger a download instead of committing a navigation.
     const disposition = response.headers()['content-disposition'] ?? '';
+    const isAttachmentPdf = isPdfContentType(contentType) && disposition.toLowerCase().startsWith('attachment');
     if (isPdfContentType(contentType) && !disposition.toLowerCase().startsWith('attachment')) {
       const dedicated = this._nextPdfIsDedicated;
       this._nextPdfIsDedicated = false;
       const restoreUrl = dedicated ? undefined : this._restoreUrl(this._mainFrameUrl);
       this._pdf = { url: response.url(), method: response.request().method(), restoreUrl, response };
-    } else if (!response.request().redirectedTo()) {
-      this._nextPdfIsDedicated = false;
-      this._pdf = undefined;
-      this.context.clearTabCloseTarget(this);
+      return;
     }
+    if (response.request().redirectedTo())
+      return;
+    if (isAttachmentPdf) {
+      const samePdf = this._pdf && urlWithoutFragment(this._pdf.url) === urlWithoutFragment(response.url());
+      if (samePdf) {
+        this._nextPdfIsDedicated = false;
+        return;
+      }
+    }
+    this._nextPdfIsDedicated = false;
+    this._pdf = undefined;
+    this.context.clearTabCloseTarget(this);
   }
 
   // There is an application page to restore only when the PDF displaced a real
@@ -714,11 +724,13 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       if (typeof abort === 'function')
         abort();
     }, cancelBindingName).catch(() => {});
+    let onAbort: (() => void) | undefined;
     const abortPromise = signal ? new Promise<never>((_, reject) => {
-      signal.addEventListener('abort', () => {
+      onAbort = () => {
         void cancelPdfRequest();
         reject(signal.reason instanceof Error ? signal.reason : new Error('The PDF refetch operation was aborted'));
-      }, { once: true });
+      };
+      signal.addEventListener('abort', onAbort);
     }) : undefined;
     const timeoutPromise = timeout ? new Promise<never>((_, reject) => {
       timeoutHandle = setTimeout(() => {
@@ -755,7 +767,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           const chunk = item.value;
           if (!chunk.length)
             continue;
-          windowBindings[bindingName]?.(toBase64(chunk));
+          await windowBindings[bindingName]?.(toBase64(chunk));
         }
 
         return {
@@ -792,6 +804,8 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         this.context.checkNetworkUrlAllowed(blockedUrl);
       throw error;
     } finally {
+      if (signal && onAbort)
+        signal.removeEventListener('abort', onAbort);
       if (timeoutHandle)
         clearTimeout(timeoutHandle);
       if (blockedUrl)
@@ -982,7 +996,7 @@ function throwIfAborted(signal?: AbortSignal): void {
 
 function isReusablePdfRequestHeader(name: string): boolean {
   // These are computed for the new request by the browser or transport.
-  return !['connection', 'content-length', 'host', 'transfer-encoding'].includes(name) && !name.startsWith('proxy-');
+  return !['connection', 'content-length', 'host', 'range', 'if-range', 'transfer-encoding'].includes(name) && !name.startsWith('proxy-');
 }
 
 function isPdfContentType(contentType: string): boolean {

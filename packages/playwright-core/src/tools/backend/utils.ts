@@ -62,10 +62,17 @@ export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>)
 }
 
 async function navigationHistoryIndex(tab: Tab): Promise<number | undefined> {
-  return await tab.page.evaluate(() => {
-    const navigation = (globalThis as typeof globalThis & { navigation?: { currentEntry?: { index?: number } } }).navigation;
-    return navigation?.currentEntry?.index;
-  }).catch(() => undefined);
+  const evaluateTimeout = new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 500));
+  const navigation = await Promise.race([
+    tab.page.evaluate(() => {
+      const navigation = (globalThis as typeof globalThis & { navigation?: { currentEntry?: { index?: number } } }).navigation;
+      return navigation?.currentEntry?.index;
+    }).catch(() => undefined),
+    evaluateTimeout
+  ]);
+  if (typeof navigation !== 'number')
+    return undefined;
+  return navigation;
 }
 
 export function eventWaiter<T>(page: playwright.Page, event: string, timeout: number): { promise: Promise<T | undefined>, abort: () => void } {
