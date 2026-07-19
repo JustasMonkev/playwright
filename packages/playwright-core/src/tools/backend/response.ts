@@ -293,7 +293,9 @@ export class Response {
     // Handle tab snapshot
     if (tabSnapshot && this._includeSnapshot !== 'none') {
       if (tabSnapshot.pdf) {
-        const lines = [`- PDF document: ${tabSnapshot.pdf.url}`];
+        const pdfUrl = tabSnapshot.pdf.url;
+        const printablePdfUrl = pdfUrl.startsWith('data:') ? `data URL (${pdfUrl.length} chars)` : pdfUrl;
+        const lines = [`- PDF document: ${printablePdfUrl}`];
         if (tabSnapshot.pdf.file)
           lines.push(`- [PDF content](${this._computeRelativeTo(tabSnapshot.pdf.file)})`);
         else

@@ -678,44 +678,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         return;
       await fileHandle.write(Buffer.from(base64, 'base64'));
     });
-    if (signal?.aborted)
-      throwIfAborted(signal);
-    const cdpSession = !pdf.local ? await this.page.context().newCDPSession(this.page) : undefined;
-    if (cdpSession) {
-      await cdpSession.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
-      if (signal?.aborted)
-        throwIfAborted(signal);
-      cdpSession.on('Fetch.requestPaused', event => {
-        if (!pdfNetworkId && (event.resourceType === 'XHR' || event.resourceType === 'Fetch') && urlWithoutFragment(event.request.url) === urlWithoutFragment(pdf.url))
-          pdfNetworkId = event.networkId;
-        if (pdfNetworkId && event.networkId === pdfNetworkId) {
-          try {
-            this.context.checkNetworkUrlAllowed(event.request.url);
-          } catch {
-            blockedUrl = event.request.url;
-            void cdpSession.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' }).catch(() => {});
-            return;
-          }
-        }
-        let headers: { name: string, value: string }[] | undefined;
-        if (pdfNetworkId && event.networkId === pdfNetworkId && !pdfRequestHeadersApplied) {
-          pdfRequestHeadersApplied = true;
-          const mergedHeaders = new Map(Object.entries(event.request.headers).map(([name, value]) => [name.toLowerCase(), { name, value: String(value) }]));
-          for (const [name, value] of Object.entries(requestHeaders)) {
-            const lowerName = name.toLowerCase();
-            if (!isReusablePdfRequestHeader(lowerName))
-              continue;
-            mergedHeaders.set(lowerName, { name, value });
-          }
-          if (!hasOriginalCookieHeader)
-            mergedHeaders.delete('cookie');
-          if (originalReferrer && !sameOriginReferrer)
-            mergedHeaders.set('referer', { name: 'Referer', value: originalReferrer });
-          headers = [...mergedHeaders.values()];
-        }
-        void cdpSession.send('Fetch.continueRequest', { requestId: event.requestId, ...(headers ? { headers } : {}) }).catch(() => {});
-      });
-    }
+    let cdpSession: playwright.CDPSession | undefined;
     const timeout = this.actionTimeoutOptions.timeout ?? 30_000;
     let timeoutHandle: NodeJS.Timeout | undefined;
     const cancelPdfRequest = () => void this.page.evaluate(name => {
@@ -742,74 +705,123 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         reject(new Error(`The PDF refetch operation timed out after ${timeout}ms.`));
       }, timeout);
     }) : undefined;
-    await this.page.evaluate(name => {
-      const windowBindings = globalThis as unknown as Record<string, (() => void) | undefined>;
-      if (!windowBindings[name])
-        windowBindings[name] = () => {};
-    }, cancelBindingName).catch(() => {});
-    throwIfAborted(signal);
-    const fetchResultPromise = this.page.evaluate(async ({ url, referrer, bindingName, cancelBindingName }) => {
-      const toBase64 = (bytes: Uint8Array) => {
-        let binary = '';
-        for (let i = 0; i < bytes.length; i += 0x8000)
-          binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-        return btoa(binary);
-      };
-
-      const windowBindings = window as unknown as Record<string, ((payload?: string) => void) | undefined>;
-      const controller = new AbortController();
-      windowBindings[cancelBindingName] = () => controller.abort();
-      try {
-        const response = await fetch(url, {
-          credentials: 'include',
-          ...(referrer ? { referrer } : { referrerPolicy: 'no-referrer' }),
-          signal: controller.signal,
-        });
-
-        const reader = response.body?.getReader();
-        if (!reader)
-          throw new Error('Response has no readable body');
-
-        while (true) {
-          const item = await reader.read();
-          if (item.done)
-            break;
-          const chunk = item.value;
-          if (!chunk.length)
-            continue;
-          await windowBindings[bindingName]?.(toBase64(chunk));
-        }
-
-        return {
-          ok: response.ok,
-          status: response.status,
-          statusText: response.statusText,
-          contentType: response.headers.get('content-type') ?? '',
-        };
-      } finally {
-        delete windowBindings[cancelBindingName];
-      }
-    }, {
-      url: pdf.url,
-      referrer: sameOriginReferrer,
-      bindingName,
-      cancelBindingName,
-    });
-    type PdfFetchResult = { ok: boolean, status: number, statusText: string, contentType: string };
-    const resultPromises: Promise<PdfFetchResult>[] = [fetchResultPromise];
-    if (abortPromise)
-      resultPromises.push(abortPromise);
-    if (timeoutPromise)
-      resultPromises.push(timeoutPromise);
+    const checkBlockedUrl = () => {
+      if (!blockedUrl)
+        return;
+      this.context.checkNetworkUrlAllowed(blockedUrl);
+      blockedUrl = undefined;
+    };
     try {
+      if (signal?.aborted)
+        throwIfAborted(signal);
+      cdpSession = !pdf.local ? await this.page.context().newCDPSession(this.page) : undefined;
+      if (cdpSession) {
+        await cdpSession.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+        if (signal?.aborted)
+          throwIfAborted(signal);
+        cdpSession.on('Fetch.requestPaused', event => {
+          if (!pdfNetworkId && (event.resourceType === 'XHR' || event.resourceType === 'Fetch') && urlWithoutFragment(event.request.url) === urlWithoutFragment(pdf.url))
+            pdfNetworkId = event.networkId;
+          if (pdfNetworkId && event.networkId === pdfNetworkId) {
+            try {
+              this.context.checkNetworkUrlAllowed(event.request.url);
+            } catch {
+              blockedUrl = event.request.url;
+              void cdpSession!.send('Fetch.failRequest', { requestId: event.requestId, errorReason: 'BlockedByClient' }).catch(() => {});
+              return;
+            }
+          }
+          let headers: { name: string, value: string }[] | undefined;
+          if (pdfNetworkId && event.networkId === pdfNetworkId && !pdfRequestHeadersApplied) {
+            pdfRequestHeadersApplied = true;
+            const mergedHeaders = new Map(Object.entries(event.request.headers).map(([name, value]) => [name.toLowerCase(), { name, value: String(value) }]));
+            for (const [name, value] of Object.entries(requestHeaders)) {
+              const lowerName = name.toLowerCase();
+              if (!isReusablePdfRequestHeader(lowerName))
+                continue;
+              mergedHeaders.set(lowerName, { name, value });
+            }
+            if (!hasOriginalCookieHeader)
+              mergedHeaders.delete('cookie');
+            if (originalReferrer && !sameOriginReferrer)
+              mergedHeaders.set('referer', { name: 'Referer', value: originalReferrer });
+            headers = [...mergedHeaders.values()];
+          }
+          void cdpSession!.send('Fetch.continueRequest', { requestId: event.requestId, ...(headers ? { headers } : {}) }).catch(() => {});
+        });
+      }
+      await this.page.evaluate(name => {
+        const windowBindings = globalThis as unknown as Record<string, (() => void) | undefined>;
+        if (!windowBindings[name])
+          windowBindings[name] = () => {};
+      }, cancelBindingName).catch(() => {});
+      throwIfAborted(signal);
+      const fetchResultPromise = this.page.evaluate(async ({ url, referrer, bindingName, cancelBindingName }) => {
+        const toBase64 = (bytes: Uint8Array) => {
+          let binary = '';
+          for (let i = 0; i < bytes.length; i += 0x8000)
+            binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+          return btoa(binary);
+        };
+
+        const windowBindings = window as unknown as Record<string, ((payload?: string) => void) | undefined>;
+        const controller = new AbortController();
+        windowBindings[cancelBindingName] = () => controller.abort();
+        try {
+          const response = await fetch(url, {
+            credentials: 'include',
+            ...(referrer ? { referrer } : { referrerPolicy: 'no-referrer' }),
+            signal: controller.signal,
+          });
+          if (!response.ok)
+            throw new Error(`Failed to read the PDF content: HTTP ${response.status} ${response.statusText}.`);
+          const contentType = response.headers.get('content-type') ?? '';
+          if (!contentType.toLowerCase().startsWith('application/pdf'))
+            throw new Error(`Failed to read the PDF content: expected application/pdf, received ${contentType || 'no content type'}.`);
+
+          const reader = response.body?.getReader();
+          if (!reader)
+            throw new Error('Response has no readable body');
+
+          while (true) {
+            const item = await reader.read();
+            if (item.done)
+              break;
+            const chunk = item.value;
+            if (!chunk.length)
+              continue;
+            await windowBindings[bindingName]?.(toBase64(chunk));
+          }
+
+          return {
+            ok: response.ok,
+            status: response.status,
+            statusText: response.statusText,
+            contentType,
+          };
+        } finally {
+          delete windowBindings[cancelBindingName];
+        }
+      }, {
+        url: pdf.url,
+        referrer: sameOriginReferrer,
+        bindingName,
+        cancelBindingName,
+      });
+      type PdfFetchResult = { ok: boolean, status: number, statusText: string, contentType: string };
+      const resultPromises: Promise<PdfFetchResult>[] = [fetchResultPromise];
+      if (abortPromise)
+        resultPromises.push(abortPromise);
+      if (timeoutPromise)
+        resultPromises.push(timeoutPromise);
       const result = await Promise.race(resultPromises);
-      if (blockedUrl)
-        this.context.checkNetworkUrlAllowed(blockedUrl);
+      checkBlockedUrl();
       if (!result.ok)
         throw new Error(`Failed to read the PDF content: HTTP ${result.status} ${result.statusText}.`);
       if (!isPdfContentType(result.contentType))
         throw new Error(`Failed to read the PDF content: expected application/pdf, received ${result.contentType || 'no content type'}.`);
     } catch (error) {
+      checkBlockedUrl();
       throw error;
     } finally {
       if (signal && onAbort)
