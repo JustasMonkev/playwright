@@ -552,8 +552,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     this._requests.length = 0;
   }
 
-  async captureSnapshot(root: playwright.Locator | undefined, depth: number | undefined, boxes: boolean | undefined, relativeTo: string | undefined): Promise<TabSnapshot> {
+  async captureSnapshot(root: playwright.Locator | undefined, depth: number | undefined, boxes: boolean | undefined, relativeTo: string | undefined, signal?: AbortSignal): Promise<TabSnapshot> {
     await this._initializedPromise;
+    throwIfAborted(signal);
     let tabSnapshot: TabSnapshot | undefined;
     const modalStates = await this._raceAgainstModalStates(async () => {
       await this._probePdfDocument();
@@ -563,7 +564,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           ariaSnapshot: '',
           modalStates: [],
           events: [],
-          pdf: await this._capturePdf(pdf),
+          pdf: await this._capturePdf(pdf, signal),
         };
         return;
       }
@@ -607,8 +608,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     }
   }
 
-  private async _capturePdf(pdf: PdfDocument): Promise<PdfSnapshot> {
+  private async _capturePdf(pdf: PdfDocument, signal?: AbortSignal): Promise<PdfSnapshot> {
     const dedicatedTab = !pdf.restoreUrl;
+    throwIfAborted(signal);
     // Saving re-issues the request, which cannot reproduce non-GET results.
     if (!pdf.local && pdf.method !== 'GET')
       return { url: pdf.url, error: `The document was produced by a ${pdf.method} request and cannot be re-fetched for saving.`, dedicatedTab };
@@ -616,33 +618,41 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     if (pdf.file && !await fs.promises.access(pdf.file).then(() => true, () => false))
       pdf.file = undefined;
     if (!pdf.file) {
+      let file = await this.context.outputFile({
+        prefix: 'pdf',
+        ext: 'pdf',
+        suggestedFilename: suggestedPdfFilename(pdf.url),
+      }, { origin: 'code' });
+      let fileHandle: fs.promises.FileHandle | undefined;
       try {
-        // The navigation response body is the built-in PDF viewer in Chromium,
-        // so re-fetch the document with the page credentials instead.
-        const data = await this._fetchPdf(pdf);
-        const suggestedFilename = suggestedPdfFilename(pdf.url);
-        let file = await this.context.outputFile({ prefix: 'pdf', ext: 'pdf', suggestedFilename }, { origin: 'code' });
         try {
-          await fs.promises.writeFile(file, data, { flag: 'wx' });
+          fileHandle = await fs.promises.open(file, 'wx');
         } catch (e) {
           if ((e as NodeJS.ErrnoException).code !== 'EEXIST')
             throw e;
-          const baseName = suggestedFilename?.replace(/\.pdf$/i, '') ?? 'pdf';
+          const baseName = suggestedPdfFilename(pdf.url)?.replace(/\.pdf$/i, '') ?? 'pdf';
           file = await this.context.outputFile({ prefix: 'pdf', ext: 'pdf', suggestedFilename: `${baseName}-${createGuid()}.pdf` }, { origin: 'code' });
-          await fs.promises.writeFile(file, data, { flag: 'wx' });
+          fileHandle = await fs.promises.open(file, 'wx');
         }
+        throwIfAborted(signal);
+        await this._fetchPdf(pdf, fileHandle, signal);
         pdf.file = file;
       } catch (e) {
+        await fileHandle?.close().catch(() => {});
+        await fs.promises.unlink(file).catch(() => {});
         debug('pw:tools:error')(e);
         return { url: pdf.url, error: e instanceof Error ? e.message : String(e), dedicatedTab };
+      } finally {
+        await fileHandle?.close().catch(() => {});
       }
     }
     return { url: pdf.url, file: pdf.file, dedicatedTab };
   }
 
-  private async _fetchPdf(pdf: PdfDocument): Promise<Buffer> {
+  private async _fetchPdf(pdf: PdfDocument, fileHandle: fs.promises.FileHandle, signal?: AbortSignal): Promise<void> {
     if (!pdf.local)
       this.context.checkNetworkUrlAllowed(pdf.url);
+    throwIfAborted(signal);
     const requestHeaders = pdf.response ? await pdf.response.request().allHeaders() : {};
     const originalReferrer = requestHeaders['referer'];
     const sameOriginReferrer = originalReferrer && sameOrigin(originalReferrer, this.page.url()) ? originalReferrer : undefined;
@@ -655,6 +665,13 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         internalRequests.add(request);
     };
     this.page.on('request', requestListener);
+    const bindingName = `__pwPdfChunk_${createGuid()}`;
+    const cancelBindingName = `__pwPdfAbort_${createGuid()}`;
+    const chunkBinding = await this.page.exposeBinding(bindingName, async (_source, base64: string) => {
+      if (!base64)
+        return;
+      await fileHandle.write(Buffer.from(base64, 'base64'));
+    });
     const cdpSession = !pdf.local ? await this.page.context().newCDPSession(this.page) : undefined;
     if (cdpSession) {
       await cdpSession.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
@@ -674,11 +691,10 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         if (pdfNetworkId && event.networkId === pdfNetworkId && !pdfRequestHeadersApplied) {
           pdfRequestHeadersApplied = true;
           const mergedHeaders = new Map(Object.entries(event.request.headers).map(([name, value]) => [name.toLowerCase(), { name, value: String(value) }]));
-          // Match the navigation's cookie state instead of silently adding
-          // cookies that a one-shot route removed from the original request.
-          mergedHeaders.delete('cookie');
           for (const [name, value] of Object.entries(requestHeaders)) {
             const lowerName = name.toLowerCase();
+            if (lowerName === 'cookie')
+              continue;
             if (!isReusablePdfRequestHeader(lowerName))
               continue;
             mergedHeaders.set(lowerName, { name, value });
@@ -690,37 +706,95 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         void cdpSession.send('Fetch.continueRequest', { requestId: event.requestId, ...(headers ? { headers } : {}) }).catch(() => {});
       });
     }
-    try {
-      const result = await this.page.evaluate(async ({ url, referrer }) => {
+    const timeout = this.actionTimeoutOptions.timeout ?? 30_000;
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const cancelPdfRequest = () => void this.page.evaluate((name) => {
+      const abort = (globalThis as any)[name];
+      if (typeof abort === 'function')
+        abort();
+    }, cancelBindingName).catch(() => {});
+    const abortPromise = signal ? new Promise<never>((_, reject) => {
+      signal.addEventListener('abort', () => {
+        void cancelPdfRequest();
+        reject(signal.reason instanceof Error ? signal.reason : new Error('The PDF refetch operation was aborted'));
+      }, { once: true });
+    }) : undefined;
+    const timeoutPromise = timeout ? new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        void cancelPdfRequest();
+        reject(new Error(`The PDF refetch operation timed out after ${timeout}ms.`));
+      }, timeout);
+    }) : undefined;
+    const fetchResultPromise = this.page.evaluate(async ({ url, referrer, bindingName, cancelBindingName }) => {
+      const toBase64 = (bytes: Uint8Array) => {
+        let binary = '';
+        for (let i = 0; i < bytes.length; i += 0x8000)
+          binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        return btoa(binary);
+      };
+
+      const controller = new AbortController();
+      (window as any)[cancelBindingName] = () => controller.abort();
+      try {
         const response = await fetch(url, {
           credentials: 'include',
           ...(referrer ? { referrer } : { referrerPolicy: 'no-referrer' }),
+          signal: controller.signal,
         });
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        let binary = '';
-        const chunkSize = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunkSize)
-          binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+
+        const reader = response.body?.getReader();
+        if (!reader)
+          throw new Error('Response has no readable body');
+
+        while (true) {
+          const item = await reader.read();
+          if (item.done)
+            break;
+          const chunk = item.value;
+          if (!chunk.length)
+            continue;
+          (window as any)[bindingName](toBase64(chunk));
+        }
+
         return {
-          base64: btoa(binary),
-          contentType: response.headers.get('content-type') ?? '',
           ok: response.ok,
           status: response.status,
           statusText: response.statusText,
+          contentType: response.headers.get('content-type') ?? '',
         };
-      }, { url: pdf.url, referrer: sameOriginReferrer });
+      } finally {
+        delete (window as any)[cancelBindingName];
+      }
+    }, {
+      url: pdf.url,
+      referrer: sameOriginReferrer,
+      bindingName,
+      cancelBindingName,
+    });
+    type PdfFetchResult = { ok: boolean, status: number, statusText: string, contentType: string };
+    const resultPromises: Promise<PdfFetchResult>[] = [fetchResultPromise];
+    if (abortPromise)
+      resultPromises.push(abortPromise);
+    if (timeoutPromise)
+      resultPromises.push(timeoutPromise);
+    try {
+      const result = await Promise.race(resultPromises);
       if (blockedUrl)
         this.context.checkNetworkUrlAllowed(blockedUrl);
       if (!result.ok)
         throw new Error(`Failed to read the PDF content: HTTP ${result.status} ${result.statusText}.`);
       if (!isPdfContentType(result.contentType))
         throw new Error(`Failed to read the PDF content: expected application/pdf, received ${result.contentType || 'no content type'}.`);
-      return Buffer.from(result.base64, 'base64');
     } catch (error) {
       if (blockedUrl)
         this.context.checkNetworkUrlAllowed(blockedUrl);
       throw error;
     } finally {
+      if (timeoutHandle)
+        clearTimeout(timeoutHandle);
+      if (blockedUrl)
+        this.context.checkNetworkUrlAllowed(blockedUrl);
+      await chunkBinding.dispose().catch(() => {});
       this.page.off('request', requestListener);
       this._requests = this._requests.filter(request => !internalRequests.has(request));
       await cdpSession?.detach().catch(() => {});
@@ -894,6 +968,14 @@ function sameOrigin(a: string, b: string): boolean {
   } catch {
     return false;
   }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted)
+    return;
+  if (signal?.reason instanceof Error)
+    throw signal.reason;
+  throw new Error('The PDF capture operation was aborted');
 }
 
 function isReusablePdfRequestHeader(name: string): boolean {

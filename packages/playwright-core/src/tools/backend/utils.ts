@@ -37,8 +37,9 @@ export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>)
   }
 
   // Back/forward can restore from the back-forward cache without issuing a
-  // request, so a URL change is also evidence of navigation.
-  const requestedNavigation = requests.some(request => request.isNavigationRequest()) || tab.page.url() !== initialUrl;
+  // request, so a URL change can be a navigation when no document request is
+  // issued. Keep waiting for pending requests after SPA URL changes.
+  const requestedNavigation = requests.some(request => request.isNavigationRequest());
   if (requestedNavigation) {
     await tab.page.mainFrame().waitForLoadState('load', { timeout: 10000 }).catch(() => {});
     const newHistoryIndex = await navigationHistoryIndex(tab);

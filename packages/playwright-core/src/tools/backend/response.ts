@@ -54,6 +54,7 @@ export class Response {
   private _includeSnapshotDepth: number | undefined;
   private _includeSnapshotBoxes: boolean | undefined;
   private _isClose: boolean = false;
+  private _signal: AbortSignal | undefined;
 
   readonly toolName: string;
   readonly toolArgs: Record<string, any>;
@@ -63,11 +64,12 @@ export class Response {
   private _json: boolean;
   private _writtenFiles = new Set<string>();
 
-  constructor(context: Context, toolName: string, toolArgs: Record<string, any>, options?: { relativeTo?: string, raw?: boolean, json?: boolean }) {
+  constructor(context: Context, toolName: string, toolArgs: Record<string, any>, options?: { relativeTo?: string, raw?: boolean, json?: boolean, signal?: AbortSignal }) {
     this._context = context;
     this.toolName = toolName;
     this.toolArgs = toolArgs;
     this._clientWorkspace = options?.relativeTo ?? context.options.cwd;
+    this._signal = options?.signal;
     this._json = options?.json ?? false;
     this._raw = this._json || (options?.raw ?? false);
   }
@@ -271,7 +273,7 @@ export class Response {
 
     // Render tab titles upon changes or when more than one tab.
     await this._context.currentTab()?.ensurePdfInNewTab();
-    const tabSnapshot = this._context.currentTab() ? await this._context.currentTabOrDie().captureSnapshot(this._includeSnapshotRoot, this._includeSnapshotDepth, this._includeSnapshotBoxes, this._clientWorkspace) : undefined;
+    const tabSnapshot = this._context.currentTab() ? await this._context.currentTabOrDie().captureSnapshot(this._includeSnapshotRoot, this._includeSnapshotDepth, this._includeSnapshotBoxes, this._clientWorkspace, this._signal) : undefined;
     // The PDF artifact is written by the tab rather than through _writeFile,
     // register it so the output budget cleanup does not remove it.
     if (tabSnapshot?.pdf?.file)
