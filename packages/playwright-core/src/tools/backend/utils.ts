@@ -19,7 +19,6 @@ import type { Tab } from './tab';
 
 export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>): Promise<R> {
   const requests: playwright.Request[] = [];
-  const initialUrl = tab.page.url();
   const historyIndex = await navigationHistoryIndex(tab);
 
   const requestListener = (request: playwright.Request) => requests.push(request);

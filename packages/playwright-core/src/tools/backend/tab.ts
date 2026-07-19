@@ -708,8 +708,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     }
     const timeout = this.actionTimeoutOptions.timeout ?? 30_000;
     let timeoutHandle: NodeJS.Timeout | undefined;
-    const cancelPdfRequest = () => void this.page.evaluate((name) => {
-      const abort = (globalThis as any)[name];
+    const cancelPdfRequest = () => void this.page.evaluate(name => {
+      const windowBindings = globalThis as unknown as Record<string, ((payload?: string) => void) | undefined>;
+      const abort = windowBindings[name];
       if (typeof abort === 'function')
         abort();
     }, cancelBindingName).catch(() => {});
@@ -733,8 +734,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         return btoa(binary);
       };
 
+      const windowBindings = window as unknown as Record<string, ((payload?: string) => void) | undefined>;
       const controller = new AbortController();
-      (window as any)[cancelBindingName] = () => controller.abort();
+      windowBindings[cancelBindingName] = () => controller.abort();
       try {
         const response = await fetch(url, {
           credentials: 'include',
@@ -753,7 +755,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           const chunk = item.value;
           if (!chunk.length)
             continue;
-          (window as any)[bindingName](toBase64(chunk));
+          windowBindings[bindingName]?.(toBase64(chunk));
         }
 
         return {
@@ -763,7 +765,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           contentType: response.headers.get('content-type') ?? '',
         };
       } finally {
-        delete (window as any)[cancelBindingName];
+        delete windowBindings[cancelBindingName];
       }
     }, {
       url: pdf.url,
