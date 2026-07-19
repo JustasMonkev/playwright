@@ -732,7 +732,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         void cancelPdfRequest();
         reject(signal.reason instanceof Error ? signal.reason : new Error('The PDF refetch operation was aborted'));
       };
-      signal.addEventListener('abort', onAbort);
+      signal.addEventListener('abort', onAbort, { once: true });
       if (signal.aborted)
         onAbort();
     }) : undefined;
