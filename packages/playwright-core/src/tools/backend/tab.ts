@@ -726,6 +726,8 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     }, cancelBindingName).catch(() => {});
     let onAbort: (() => void) | undefined;
     const abortPromise = signal ? new Promise<never>((_, reject) => {
+      if (signal.aborted)
+        throwIfAborted(signal);
       onAbort = () => {
         void cancelPdfRequest();
         reject(signal.reason instanceof Error ? signal.reason : new Error('The PDF refetch operation was aborted'));
