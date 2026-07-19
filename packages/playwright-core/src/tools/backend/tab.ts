@@ -742,6 +742,11 @@ export class Tab extends EventEmitter<TabEventsInterface> {
         reject(new Error(`The PDF refetch operation timed out after ${timeout}ms.`));
       }, timeout);
     }) : undefined;
+    await this.page.evaluate(name => {
+      const windowBindings = globalThis as unknown as Record<string, (() => void) | undefined>;
+      if (!windowBindings[name])
+        windowBindings[name] = () => {};
+    }, cancelBindingName).catch(() => {});
     throwIfAborted(signal);
     const fetchResultPromise = this.page.evaluate(async ({ url, referrer, bindingName, cancelBindingName }) => {
       const toBase64 = (bytes: Uint8Array) => {
