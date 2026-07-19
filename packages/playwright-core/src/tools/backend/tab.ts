@@ -348,6 +348,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   }
 
   async ensurePdfInNewTab(restoreDirection: 'back' | 'forward' = 'back'): Promise<void> {
+    await this._probePdfDocument();
     const pdf = this._currentPdf();
     if (!pdf?.restoreUrl || pdf.moveAttempted)
       return;
@@ -649,9 +650,10 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           if (!shouldRetryPdfFetchOutsidePage(pdf, e, signal))
             throw e;
           // The in-page fetch is constrained by the PDF document (e.g. its
-          // CSP) - retry through the api request context, which is not.
+          // CSP) - retry from a neutral page while preserving the original
+          // request headers and streamed, abortable body handling.
           await fileHandle.truncate(0);
-          await this._fetchPdfViaApiRequest(pdf, fileHandle, signal);
+          await this._fetchPdfOutsidePage(pdf, fileHandle, signal);
         }
         pdf.file = file;
       } catch (e) {
@@ -676,35 +678,38 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       await fileHandle.write(chunk as Buffer);
   }
 
-  // Follows redirects manually so that every hop passes the network origin policy.
-  private async _fetchPdfViaApiRequest(pdf: PdfDocument, fileHandle: fs.promises.FileHandle, signal?: AbortSignal): Promise<void> {
-    const timeout = this.actionTimeoutOptions.timeout ?? 30_000;
-    let url = pdf.url;
-    for (let hop = 0; hop < 20; hop++) {
-      throwIfAborted(signal);
-      this.context.checkNetworkUrlAllowed(url);
-      const response = await this.page.request.get(url, { maxRedirects: 0, timeout });
-      const status = response.status();
-      if (status >= 300 && status < 400) {
-        const location = response.headers()['location'];
-        if (!location)
-          break;
-        url = new URL(location, url).href;
-        continue;
+  private async _fetchPdfOutsidePage(pdf: PdfDocument, fileHandle: fs.promises.FileHandle, signal?: AbortSignal): Promise<void> {
+    throwIfAborted(signal);
+    const page = await this.page.context().newPage();
+    try {
+      await Tab.forPage(page)?.waitForInitialized().catch(e => debug('pw:tools:error')(e));
+      // Load an inert document on the PDF's own origin so the capture fetch is
+      // same-origin - it needs no CORS and is free of the PDF document's own
+      // CSP. Credentialed cross-origin fetches from an opaque about:blank
+      // origin are rejected, so only fall back to that (with CORS injection)
+      // when the origin document cannot be loaded.
+      const pdfOrigin = originOf(pdf.url);
+      let corsOrigin: string | undefined;
+      if (pdfOrigin)
+        await page.goto(pdfOrigin, { waitUntil: 'commit' }).catch(e => debug('pw:tools:error')(e));
+      if (!pdfOrigin || originOf(page.url()) !== pdfOrigin) {
+        await page.goto('about:blank').catch(e => debug('pw:tools:error')(e));
+        corsOrigin = new URL(page.url()).origin;
       }
-      if (!response.ok())
-        throw new Error(`Failed to read the PDF content: HTTP ${status} ${response.statusText()}.`);
-      const contentType = response.headers()['content-type'] ?? '';
-      if (!isPdfContentType(contentType))
-        throw new Error(`Failed to read the PDF content: expected application/pdf, received ${contentType || 'no content type'}.`);
-      const data = await response.body();
-      await fileHandle.write(data, 0, data.length, 0);
-      return;
+      throwIfAborted(signal);
+      await this._fetchPdf(pdf, fileHandle, signal, page, corsOrigin);
+    } finally {
+      await page.close().catch(() => {});
     }
-    throw new Error('Failed to read the PDF content: too many redirects.');
   }
 
-  private async _fetchPdf(pdf: PdfDocument, fileHandle: fs.promises.FileHandle, signal?: AbortSignal): Promise<void> {
+  private async _fetchPdf(
+    pdf: PdfDocument,
+    fileHandle: fs.promises.FileHandle,
+    signal?: AbortSignal,
+    page: playwright.Page = this.page,
+    corsOrigin?: string,
+  ): Promise<void> {
     if (pdf.url.startsWith('file:')) {
       await this._readPdfFromFile(pdf.url, fileHandle);
       return;
@@ -715,7 +720,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     const requestHeaders = pdf.response ? await pdf.response.request().allHeaders() : {};
     const hasOriginalCookieHeader = Object.keys(requestHeaders).some(name => name.toLowerCase() === 'cookie');
     const originalReferrer = requestHeaders['referer'];
-    const sameOriginReferrer = originalReferrer && sameOrigin(originalReferrer, this.page.url()) ? originalReferrer : undefined;
+    const sameOriginReferrer = originalReferrer && sameOrigin(originalReferrer, page.url()) ? originalReferrer : undefined;
     let blockedUrl: string | undefined;
     let pdfNetworkId: string | undefined;
     let pdfRequestHeadersApplied = false;
@@ -724,10 +729,10 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       if ((request.resourceType() === 'fetch' && urlWithoutFragment(request.url()) === urlWithoutFragment(pdf.url)) || (request.redirectedFrom() && internalRequests.has(request.redirectedFrom()!)))
         internalRequests.add(request);
     };
-    this.page.on('request', requestListener);
+    page.on('request', requestListener);
     const bindingName = `__pwPdfChunk_${createGuid()}`;
     const cancelBindingName = `__pwPdfAbort_${createGuid()}`;
-    const chunkBinding = await this.page.exposeBinding(bindingName, async (_source, base64: string) => {
+    const chunkBinding = await page.exposeBinding(bindingName, async (_source, base64: string) => {
       if (!base64)
         return;
       await fileHandle.write(Buffer.from(base64, 'base64'));
@@ -735,7 +740,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     let cdpSession: playwright.CDPSession | undefined;
     const timeout = this.actionTimeoutOptions.timeout ?? 30_000;
     let timeoutHandle: NodeJS.Timeout | undefined;
-    const cancelPdfRequest = () => void this.page.evaluate(name => {
+    const cancelPdfRequest = () => void page.evaluate(name => {
       const windowBindings = globalThis as unknown as Record<string, ((payload?: string) => void) | undefined>;
       const abort = windowBindings[name];
       if (typeof abort === 'function')
@@ -768,12 +773,38 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     try {
       if (signal?.aborted)
         throwIfAborted(signal);
-      cdpSession = !pdf.local ? await this.page.context().newCDPSession(this.page) : undefined;
+      cdpSession = !pdf.local ? await page.context().newCDPSession(page) : undefined;
       if (cdpSession) {
-        await cdpSession.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+        const patterns: { urlPattern: string, requestStage: 'Request' | 'Response' }[] = [
+          { urlPattern: '*', requestStage: 'Request' },
+        ];
+        if (corsOrigin)
+          patterns.push({ urlPattern: '*', requestStage: 'Response' });
+        await cdpSession.send('Fetch.enable', { patterns });
         if (signal?.aborted)
           throwIfAborted(signal);
         cdpSession.on('Fetch.requestPaused', event => {
+          const responseStage = event.responseStatusCode !== undefined || event.responseErrorReason !== undefined;
+          if (responseStage) {
+            if (corsOrigin && pdfNetworkId && event.networkId === pdfNetworkId && event.responseStatusCode !== undefined) {
+              const responseHeaders = (event.responseHeaders ?? []).filter(header => {
+                const name = header.name.toLowerCase();
+                return name !== 'access-control-allow-origin' && name !== 'access-control-allow-credentials';
+              });
+              responseHeaders.push(
+                  { name: 'Access-Control-Allow-Origin', value: corsOrigin },
+                  { name: 'Access-Control-Allow-Credentials', value: 'true' });
+              void cdpSession!.send('Fetch.continueResponse', {
+                requestId: event.requestId,
+                responseCode: event.responseStatusCode,
+                responsePhrase: event.responseStatusText,
+                responseHeaders,
+              }).catch(() => {});
+            } else {
+              void cdpSession!.send('Fetch.continueResponse', { requestId: event.requestId }).catch(() => {});
+            }
+            return;
+          }
           if (!pdfNetworkId && (event.resourceType === 'XHR' || event.resourceType === 'Fetch') && urlWithoutFragment(event.request.url) === urlWithoutFragment(pdf.url))
             pdfNetworkId = event.networkId;
           if (pdfNetworkId && event.networkId === pdfNetworkId) {
@@ -804,13 +835,13 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           void cdpSession!.send('Fetch.continueRequest', { requestId: event.requestId, ...(headers ? { headers } : {}) }).catch(() => {});
         });
       }
-      await this.page.evaluate(name => {
+      await page.evaluate(name => {
         const windowBindings = globalThis as unknown as Record<string, (() => void) | undefined>;
         if (!windowBindings[name])
           windowBindings[name] = () => {};
       }, cancelBindingName).catch(() => {});
       throwIfAborted(signal);
-      const fetchResultPromise = this.page.evaluate(async ({ url, referrer, bindingName, cancelBindingName }) => {
+      const fetchResultPromise = page.evaluate(async ({ url, referrer, bindingName, cancelBindingName }) => {
         const toBase64 = (bytes: Uint8Array) => {
           let binary = '';
           for (let i = 0; i < bytes.length; i += 0x8000)
@@ -830,7 +861,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           if (!response.ok)
             throw new Error(`Failed to read the PDF content: HTTP ${response.status} ${response.statusText}.`);
           const contentType = response.headers.get('content-type') ?? '';
-          if (!contentType.toLowerCase().startsWith('application/pdf'))
+          if (contentType.split(';', 1)[0].trim().toLowerCase() !== 'application/pdf')
             throw new Error(`Failed to read the PDF content: expected application/pdf, received ${contentType || 'no content type'}.`);
 
           const reader = response.body?.getReader();
@@ -883,7 +914,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       if (timeoutHandle)
         clearTimeout(timeoutHandle);
       await chunkBinding.dispose().catch(() => {});
-      this.page.off('request', requestListener);
+      page.off('request', requestListener);
       this._requests = this._requests.filter(request => !internalRequests.has(request));
       await cdpSession?.detach().catch(() => {});
     }
@@ -1058,6 +1089,17 @@ function sameOrigin(a: string, b: string): boolean {
   }
 }
 
+// Returns a same-origin navigable origin (http/https only), or undefined.
+function originOf(url: string): string | undefined {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+      return parsed.origin;
+  } catch {
+  }
+  return undefined;
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
   if (!signal?.aborted)
     return;
@@ -1093,12 +1135,33 @@ function shouldRetryPdfFetchOutsidePage(pdf: PdfDocument, error: unknown, signal
   return true;
 }
 
+// Leave room for the collision suffix added by _capturePdf under common
+// 255-byte per-component filename limits.
+const kMaxSuggestedPdfFilenameBytes = 200;
+
+function truncateToUtf8Bytes(value: string, maxBytes: number): string {
+  let result = '';
+  let bytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character);
+    if (bytes + characterBytes > maxBytes)
+      break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return result;
+}
+
 function suggestedPdfFilename(url: string): string | undefined {
   try {
     const pathname = new URL(url).pathname;
     const baseName = decodeURIComponent(pathname.substring(pathname.lastIndexOf('/') + 1));
-    if (baseName.toLowerCase().endsWith('.pdf'))
-      return sanitizeForFilePath(baseName);
+    if (baseName.toLowerCase().endsWith('.pdf')) {
+      const sanitized = sanitizeForFilePath(baseName);
+      const extension = sanitized.slice(-4);
+      const maxStemBytes = kMaxSuggestedPdfFilenameBytes - Buffer.byteLength(extension);
+      return truncateToUtf8Bytes(sanitized.slice(0, -4), maxStemBytes) + extension;
+    }
   } catch {
   }
   return undefined;

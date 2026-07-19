@@ -39,12 +39,14 @@ export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>)
   // request, so a URL change can be a navigation when no document request is
   // issued. Keep waiting for pending requests after SPA URL changes.
   const requestedNavigation = requests.some(request => request.isNavigationRequest());
-  if (requestedNavigation) {
+  if (requestedNavigation)
     await tab.page.mainFrame().waitForLoadState('load', { timeout: 10000 }).catch(() => {});
-    const newHistoryIndex = await navigationHistoryIndex(tab);
+  const newHistoryIndex = await navigationHistoryIndex(tab);
+  const historyChanged = historyIndex !== undefined && newHistoryIndex !== undefined && newHistoryIndex !== historyIndex;
+  if (requestedNavigation || historyChanged)
     await tab.ensurePdfInNewTab(historyIndex !== undefined && newHistoryIndex !== undefined && newHistoryIndex < historyIndex ? 'forward' : 'back');
+  if (requestedNavigation)
     return result;
-  }
 
   const promises: Promise<any>[] = [];
   for (const request of requests) {

@@ -416,7 +416,7 @@ test('pdf refetch preserves navigation headers and route removals', async ({ sta
   expect(fs.readFileSync(path.join(outputDir, 'header-sensitive.pdf'), 'utf8')).toBe('%PDF-1.4 header sensitive');
 });
 
-test('pdf refetch preserves headers from a one-shot initPage route', async ({ startClient, mcpBrowser, server }, testInfo) => {
+test('pdf CSP fallback preserves headers from a one-shot initPage route', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   server.setRoute('/authorized.pdf', (req, res) => {
     if (req.headers.authorization !== 'Bearer pdf-token') {
@@ -424,12 +424,19 @@ test('pdf refetch preserves headers from a one-shot initPage route', async ({ st
       res.end('missing authorization');
       return;
     }
-    res.writeHead(200, { 'Content-Type': 'application/pdf' });
+    res.writeHead(200, {
+      'Content-Type': 'application/pdf',
+      'Content-Security-Policy': "connect-src 'none'",
+    });
     res.end('%PDF-1.4 authorized');
   });
   const initPagePath = testInfo.outputPath('authorize-pdf.ts');
   await fs.promises.writeFile(initPagePath, `
+    let initialized = false;
     export default async ({ page }) => {
+      if (initialized)
+        return;
+      initialized = true;
       const handler = async route => {
         await route.continue({ headers: { ...await route.request().allHeaders(), authorization: 'Bearer pdf-token' } });
         await page.unroute('**/authorized.pdf', handler);
@@ -623,6 +630,22 @@ test('pdf filename avoids Windows device names', async ({ startClient, mcpBrowse
   expect(fs.readFileSync(path.join(outputDir, '_CON.pdf'), 'utf8')).toBe('%PDF-1.4 reserved name');
 });
 
+test('pdf filename derived from a URL is bounded', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+
+  const filename = `${'a'.repeat(300)}.pdf`;
+  server.setContent('/' + filename, '%PDF-1.4 long name', 'application/pdf');
+  const outputDir = testInfo.outputPath('output');
+
+  const { client } = await startClient({ config: { outputDir } });
+  await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/' + filename } });
+
+  const files = fs.readdirSync(outputDir).filter(file => file.endsWith('.pdf'));
+  expect(files).toHaveLength(1);
+  expect(Buffer.byteLength(files[0])).toBeLessThanOrEqual(200);
+  expect(fs.readFileSync(path.join(outputDir, files[0]), 'utf8')).toBe('%PDF-1.4 long name');
+});
+
 test('failed pdf refetch is reported', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
   let requests = 0;
@@ -643,6 +666,30 @@ test('failed pdf refetch is reported', async ({ startClient, mcpBrowser, server 
     arguments: { url: server.PREFIX + '/once.pdf' },
   });
   expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('HTTP 410 Gone');
+  expect(fs.existsSync(outputDir) ? fs.readdirSync(outputDir).filter(file => file.endsWith('.pdf')) : []).toHaveLength(0);
+});
+
+test('pdf refetch validates the media type before reading the body', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+
+  let requests = 0;
+  server.setRoute('/wrong-type.pdf', (req, res) => {
+    if (++requests === 1) {
+      res.writeHead(200, { 'Content-Type': 'application/pdf' });
+      res.end('%PDF-1.4 initially');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/pdfx', 'Content-Length': '2048' });
+    res.write(Buffer.alloc(1024));
+    const timeout = setTimeout(() => res.end(Buffer.alloc(1024)), 3000);
+    res.on('close', () => clearTimeout(timeout));
+  });
+
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({ config: { outputDir, timeouts: { action: 1000 } } });
+  const response = await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/wrong-type.pdf' } });
+
+  expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('expected application/pdf, received application/pdfx');
   expect(fs.existsSync(outputDir) ? fs.readdirSync(outputDir).filter(file => file.endsWith('.pdf')) : []).toHaveLength(0);
 });
 
@@ -742,18 +789,25 @@ test('same-url pdf restoration is attempted and verified', async ({ startClient,
   expect(reportRequests).toBe(4);
 });
 
-test('pdf larger than outputMaxSize is captured', async ({ startClient, mcpBrowser, server }, testInfo) => {
+test('pdf CSP fallback streams content larger than outputMaxSize', async ({ startClient, mcpBrowser, server }, testInfo) => {
   test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+
+  const pdf = Buffer.alloc(2 * 1024 * 1024);
+  pdf.write('%PDF-1.4');
   server.setRoute('/large.pdf', (req, res) => {
-    res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': '100' });
-    res.end(Buffer.alloc(100));
+    res.writeHead(200, {
+      'Content-Type': 'application/pdf',
+      'Content-Length': String(pdf.length),
+      'Content-Security-Policy': "connect-src 'none'",
+    });
+    res.end(pdf);
   });
   const outputDir = testInfo.outputPath('output');
   const { client } = await startClient({ config: { outputDir, outputMaxSize: 10 } });
 
   const response = await client.callTool({ name: 'browser_navigate', arguments: { url: server.PREFIX + '/large.pdf' } });
   expect(parseResponse(response, testInfo.outputPath()).inlineSnapshot).toContain('[PDF content]');
-  expect(fs.statSync(path.join(outputDir, 'large.pdf')).size).toBe(100);
+  expect(fs.statSync(path.join(outputDir, 'large.pdf')).size).toBe(pdf.length);
 });
 
 test('navigating back to a pdf in history moves it to a new tab', async ({ startClient, mcpBrowser, server }, testInfo) => {
@@ -997,29 +1051,4 @@ test('pdf is not fetched when snapshots are disabled', async ({ startClient, mcp
   });
   expect(hits).toBe(2);
   expect(fs.readFileSync(testInfo.outputPath('output', 'counted.pdf'), 'utf-8')).toBe('%PDF-1.4 counted');
-});
-
-test('pdf capture falls back outside the page when the in-page fetch fails', async ({ startClient, mcpBrowser, server }, testInfo) => {
-  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
-  // Sever in-page fetches (Sec-Fetch-Dest: empty) while serving navigations
-  // and plain requests, so the in-page path fails without a response.
-  server.setRoute('/guarded.pdf', (req, res) => {
-    if (req.headers['sec-fetch-dest'] === 'empty') {
-      req.socket.destroy();
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'application/pdf' });
-    res.end('%PDF-1.4 guarded');
-  });
-  const { client } = await startClient({
-    config: { outputDir: testInfo.outputPath('output') },
-  });
-
-  expect(await client.callTool({
-    name: 'browser_navigate',
-    arguments: { url: server.PREFIX + '/guarded.pdf' },
-  })).toHaveResponse({
-    inlineSnapshot: expect.stringContaining('[PDF content]'),
-  });
-  expect(fs.readFileSync(testInfo.outputPath('output', 'guarded.pdf'), 'utf-8')).toBe('%PDF-1.4 guarded');
 });
