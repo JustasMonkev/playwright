@@ -273,7 +273,7 @@ export class Response {
 
     // Render tab titles upon changes or when more than one tab.
     await this._context.currentTab()?.ensurePdfInNewTab();
-    const tabSnapshot = this._context.currentTab() ? await this._context.currentTabOrDie().captureSnapshot(this._includeSnapshotRoot, this._includeSnapshotDepth, this._includeSnapshotBoxes, this._clientWorkspace, this._signal) : undefined;
+    const tabSnapshot = this._context.currentTab() ? await this._context.currentTabOrDie().captureSnapshot(this._includeSnapshotRoot, this._includeSnapshotDepth, this._includeSnapshotBoxes, this._clientWorkspace, this._signal, this._includeSnapshot === 'none') : undefined;
     // The PDF artifact is written by the tab rather than through _writeFile,
     // register it so the output budget cleanup does not remove it.
     if (tabSnapshot?.pdf?.file)

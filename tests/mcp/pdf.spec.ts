@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import url from 'url';
 
 import { test, expect, parseResponse } from './fixtures';
 
@@ -513,7 +514,7 @@ test('revisited local pdf url is detected again', async ({ startClient, mcpBrows
   await client.callTool({ name: 'browser_navigate_back' });
   await client.callTool({ name: 'browser_evaluate', arguments: { function: '() => history.forward()' } });
   expect(await client.callTool({ name: 'browser_wait_for', arguments: { time: 1 } })).toHaveResponse({
-    inlineSnapshot: expect.stringContaining(`- PDF document: ${dataUrl}`),
+    inlineSnapshot: expect.stringContaining(`- PDF document: data URL (${dataUrl.length} chars)`),
   });
 });
 
@@ -943,4 +944,82 @@ test('navigating to a pdf in a fresh tab keeps a single tab', async ({ startClie
   });
 
   expect(fs.existsSync(testInfo.outputPath('output', 'empty.pdf'))).toBeTruthy();
+});
+
+test('pdf from a file url is read directly', async ({ startClient, mcpBrowser }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output'), allowUnrestrictedFileAccess: true },
+  });
+
+  const assetPath = path.join(__dirname, '../assets/empty.pdf');
+  expect(await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: url.pathToFileURL(assetPath).href },
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('[PDF content]'),
+  });
+
+  const pdfPath = testInfo.outputPath('output', 'empty.pdf');
+  expect(fs.existsSync(pdfPath)).toBeTruthy();
+  expect(fs.readFileSync(pdfPath).equals(fs.readFileSync(assetPath))).toBeTruthy();
+});
+
+test('pdf is not fetched when snapshots are disabled', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  let hits = 0;
+  server.setRoute('/counted.pdf', (req, res) => {
+    hits++;
+    res.writeHead(200, { 'Content-Type': 'application/pdf' });
+    res.end('%PDF-1.4 counted');
+  });
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output'), snapshot: { mode: 'none' } },
+  });
+
+  await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/counted.pdf' },
+  });
+  await client.callTool({
+    name: 'browser_tabs',
+    arguments: { action: 'list' },
+  });
+  // Only the navigation itself hit the server - no capture without a snapshot.
+  expect(hits).toBe(1);
+  expect(fs.existsSync(testInfo.outputPath('output', 'counted.pdf'))).toBeFalsy();
+
+  // An explicit snapshot captures the document.
+  expect(await client.callTool({
+    name: 'browser_snapshot',
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('[PDF content]'),
+  });
+  expect(hits).toBe(2);
+  expect(fs.readFileSync(testInfo.outputPath('output', 'counted.pdf'), 'utf-8')).toBe('%PDF-1.4 counted');
+});
+
+test('pdf capture falls back outside the page when the in-page fetch fails', async ({ startClient, mcpBrowser, server }, testInfo) => {
+  test.skip(!!mcpBrowser && !['chromium', 'chrome', 'msedge'].includes(mcpBrowser), 'PDF viewer is only available in Chromium.');
+  // Sever in-page fetches (Sec-Fetch-Dest: empty) while serving navigations
+  // and plain requests, so the in-page path fails without a response.
+  server.setRoute('/guarded.pdf', (req, res) => {
+    if (req.headers['sec-fetch-dest'] === 'empty') {
+      req.socket.destroy();
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/pdf' });
+    res.end('%PDF-1.4 guarded');
+  });
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
+
+  expect(await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.PREFIX + '/guarded.pdf' },
+  })).toHaveResponse({
+    inlineSnapshot: expect.stringContaining('[PDF content]'),
+  });
+  expect(fs.readFileSync(testInfo.outputPath('output', 'guarded.pdf'), 'utf-8')).toBe('%PDF-1.4 guarded');
 });

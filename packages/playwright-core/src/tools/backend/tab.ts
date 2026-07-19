@@ -15,6 +15,7 @@
  */
 
 import fs from 'fs';
+import { fileURLToPath } from 'url';
 import { EventEmitter } from 'events';
 import debug from 'debug';
 import { asLocator } from '@isomorphic/locatorGenerators';
@@ -557,7 +558,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     this._requests.length = 0;
   }
 
-  async captureSnapshot(root: playwright.Locator | undefined, depth: number | undefined, boxes: boolean | undefined, relativeTo: string | undefined, signal?: AbortSignal): Promise<TabSnapshot> {
+  async captureSnapshot(root: playwright.Locator | undefined, depth: number | undefined, boxes: boolean | undefined, relativeTo: string | undefined, signal?: AbortSignal, skipPdfCapture?: boolean): Promise<TabSnapshot> {
     await this._initializedPromise;
     throwIfAborted(signal);
     let tabSnapshot: TabSnapshot | undefined;
@@ -569,7 +570,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           ariaSnapshot: '',
           modalStates: [],
           events: [],
-          pdf: await this._capturePdf(pdf, signal),
+          // When the response will not include a snapshot, do not fetch the
+          // document - only report what was already captured.
+          pdf: skipPdfCapture ? { url: pdf.url, file: pdf.file, dedicatedTab: !pdf.restoreUrl } : await this._capturePdf(pdf, signal),
         };
         return;
       }
@@ -640,7 +643,16 @@ export class Tab extends EventEmitter<TabEventsInterface> {
           fileHandle = await fs.promises.open(file, 'wx');
         }
         throwIfAborted(signal);
-        await this._fetchPdf(pdf, fileHandle, signal);
+        try {
+          await this._fetchPdf(pdf, fileHandle, signal);
+        } catch (e) {
+          if (!shouldRetryPdfFetchOutsidePage(pdf, e, signal))
+            throw e;
+          // The in-page fetch is constrained by the PDF document (e.g. its
+          // CSP) - retry through the api request context, which is not.
+          await fileHandle.truncate(0);
+          await this._fetchPdfViaApiRequest(pdf, fileHandle, signal);
+        }
         pdf.file = file;
       } catch (e) {
         await fileHandle?.close().catch(() => {});
@@ -654,7 +666,49 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     return { url: pdf.url, file: pdf.file, dedicatedTab };
   }
 
+  // In-page fetch() is not permitted on the file: scheme, so read the
+  // permitted local file directly.
+  private async _readPdfFromFile(fileUrl: string, fileHandle: fs.promises.FileHandle): Promise<void> {
+    if (!this.context.config.allowUnrestrictedFileAccess)
+      throw new Error(`Access to "file:" protocol is blocked. Attempted URL: "${fileUrl}"`);
+    const filePath = fileURLToPath(urlWithoutFragment(fileUrl));
+    for await (const chunk of fs.createReadStream(filePath))
+      await fileHandle.write(chunk as Buffer);
+  }
+
+  // Follows redirects manually so that every hop passes the network origin policy.
+  private async _fetchPdfViaApiRequest(pdf: PdfDocument, fileHandle: fs.promises.FileHandle, signal?: AbortSignal): Promise<void> {
+    const timeout = this.actionTimeoutOptions.timeout ?? 30_000;
+    let url = pdf.url;
+    for (let hop = 0; hop < 20; hop++) {
+      throwIfAborted(signal);
+      this.context.checkNetworkUrlAllowed(url);
+      const response = await this.page.request.get(url, { maxRedirects: 0, timeout });
+      const status = response.status();
+      if (status >= 300 && status < 400) {
+        const location = response.headers()['location'];
+        if (!location)
+          break;
+        url = new URL(location, url).href;
+        continue;
+      }
+      if (!response.ok())
+        throw new Error(`Failed to read the PDF content: HTTP ${status} ${response.statusText()}.`);
+      const contentType = response.headers()['content-type'] ?? '';
+      if (!isPdfContentType(contentType))
+        throw new Error(`Failed to read the PDF content: expected application/pdf, received ${contentType || 'no content type'}.`);
+      const data = await response.body();
+      await fileHandle.write(data, 0, data.length, 0);
+      return;
+    }
+    throw new Error('Failed to read the PDF content: too many redirects.');
+  }
+
   private async _fetchPdf(pdf: PdfDocument, fileHandle: fs.promises.FileHandle, signal?: AbortSignal): Promise<void> {
+    if (pdf.url.startsWith('file:')) {
+      await this._readPdfFromFile(pdf.url, fileHandle);
+      return;
+    }
     if (!pdf.local)
       this.context.checkNetworkUrlAllowed(pdf.url);
     throwIfAborted(signal);
@@ -1019,6 +1073,24 @@ function isReusablePdfRequestHeader(name: string): boolean {
 
 function isPdfContentType(contentType: string): boolean {
   return contentType.split(';', 1)[0].trim().toLowerCase() === 'application/pdf';
+}
+
+// Server responses, policy violations and cancellations are authoritative -
+// only retry outside the page when the in-page request could not be issued at
+// all (e.g. rejected by the document before hitting the network).
+function shouldRetryPdfFetchOutsidePage(pdf: PdfDocument, error: unknown, signal?: AbortSignal): boolean {
+  if (pdf.local || signal?.aborted)
+    return false;
+  if (!pdf.url.startsWith('http:') && !pdf.url.startsWith('https:'))
+    return false;
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith('Failed to read the PDF content:'))
+    return false;
+  if (message.includes('blocked by the network origin policy'))
+    return false;
+  if (message.includes('timed out after'))
+    return false;
+  return true;
 }
 
 function suggestedPdfFilename(url: string): string | undefined {
