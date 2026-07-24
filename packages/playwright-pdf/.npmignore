@@ -1,0 +1,10 @@
+**/*
+
+!README.md
+!ARCHITECTURE.md
+!LICENSE
+!NOTICE
+!lib/**
+!index.d.ts
+!index.js
+!index.mjs
