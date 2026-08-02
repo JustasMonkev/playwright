@@ -21,6 +21,7 @@ import path from 'path';
 import debug from 'debug';
 import { escapeWithQuotes } from '@isomorphic/stringUtils';
 import { disposeAll } from '@isomorphic/disposable';
+import { urlMatches } from '@isomorphic/urlMatch';
 import { eventsHelper } from '@utils/eventsHelper';
 import { isPathInside, isSystemDirectory, isWritable } from '@utils/fileUtils';
 import { playwright } from '../../inprocess';
@@ -98,6 +99,7 @@ export class Context {
   private _tabs: Tab[] = [];
   private _currentTab: Tab | undefined;
   private _routes: RouteEntry[] = [];
+  private _tabCloseTargets = new WeakMap<Tab, Tab>();
   private _video: {
     params: VideoParams;
     fileNames: string[];
@@ -178,6 +180,14 @@ export class Context {
     return tab;
   }
 
+  setTabCloseTarget(tab: Tab, target: Tab) {
+    this._tabCloseTargets.set(tab, target);
+  }
+
+  clearTabCloseTarget(tab: Tab) {
+    this._tabCloseTargets.delete(tab);
+  }
+
   async ensureTab(): Promise<Tab> {
     await this.ensureBrowserContext();
     const crashed = this._currentTab?.crashed;
@@ -256,10 +266,13 @@ export class Context {
     const index = this._tabs.indexOf(tab);
     if (index === -1)
       return;
+    const closeTarget = this._tabCloseTargets.get(tab);
     this._tabs.splice(index, 1);
 
-    if (this._currentTab === tab)
-      this._currentTab = this._tabs[Math.min(index, this._tabs.length - 1)];
+    if (this._currentTab === tab) {
+      this._currentTab = closeTarget && this._tabs.includes(closeTarget) ? closeTarget : this._tabs[Math.min(index, this._tabs.length - 1)];
+      this._currentTab?.page.bringToFront().catch(() => {});
+    }
   }
 
   routes(): RouteEntry[] {
@@ -344,6 +357,13 @@ export class Context {
       return;
     if (new URL(url).protocol === 'file:')
       throw new Error(`Access to "file:" protocol is blocked. Attempted URL: "${url}"`);
+  }
+
+  checkNetworkUrlAllowed(url: string) {
+    const { allowedOrigins, blockedOrigins } = this.config.network ?? {};
+    const matches = (origin: string) => urlMatches(undefined, url, originOrHostGlob(origin));
+    if (blockedOrigins?.some(matches) || (allowedOrigins?.length && !allowedOrigins.some(matches)))
+      throw new Error(`Request to "${url}" is blocked by the network origin policy.`);
   }
 
   lookupSecret(secretName: string): { value: string, code: string } {

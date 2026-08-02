@@ -47,6 +47,7 @@ async function globalSetup() {
 
     const builds = await Promise.all([
       build('playwright-core'),
+      build('playwright-pdf', '@playwright/pdf'),
       build('playwright-test', '@playwright/test'),
       build('playwright'),
       build('playwright-chromium'),

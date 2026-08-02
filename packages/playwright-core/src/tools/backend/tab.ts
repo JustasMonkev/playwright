@@ -14,12 +14,16 @@
  * limitations under the License.
  */
 
+import fs from 'fs';
+import { fileURLToPath } from 'url';
 import { EventEmitter } from 'events';
 import debug from 'debug';
+import { capturePdf, isLocalPdfUrl, isPdfContentType, suggestedPdfFilename, urlWithoutFragment } from '@playwright/pdf';
 import { asLocator } from '@isomorphic/locatorGenerators';
 import { locatorOrSelectorAsSelector } from '@isomorphic/locatorParser';
 import { ManualPromise } from '@isomorphic/manualPromise';
 import { eventsHelper } from '@utils/eventsHelper';
+import { createGuid } from '@utils/crypto';
 import { disposeAll } from '@isomorphic/disposable';
 import { waitForCompletion, eventWaiter } from './utils';
 import { LogFile } from './logFile';
@@ -81,11 +85,32 @@ export type TabHeader = {
   console: { total: number, warnings: number, errors: number };
 };
 
+type PdfDocument = {
+  url: string;
+  method: string;
+  // The application page displaced by this PDF navigation, when restorable.
+  restoreUrl?: string;
+  response?: playwright.Response;
+  // Set for documents that never hit the network (blob: and data: urls).
+  local?: boolean;
+  moveAttempted?: boolean;
+  file?: string;
+};
+
+type PdfSnapshot = {
+  url: string;
+  file?: string;
+  error?: string;
+  // Set when the tab contains nothing but the PDF, so closing it is safe.
+  dedicatedTab: boolean;
+};
+
 type TabSnapshot = {
   ariaSnapshot: string;
   modalStates: ModalState[];
   events: EventEntry[];
   consoleLink?: string;
+  pdf?: PdfSnapshot;
 };
 
 export class Tab extends EventEmitter<TabEventsInterface> {
@@ -98,6 +123,11 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   private _onPageClose: (tab: Tab) => void;
   crashed = false;
   private _modalStates: ModalState[] = [];
+  private _pdf: PdfDocument | undefined;
+  private _mainFrameUrl: string;
+  private _previousMainFrameUrl: string = 'about:blank';
+  private _pdfProbedUrl: string | undefined;
+  private _nextPdfIsDedicated = false;
   private _initializedPromise: Promise<void>;
   private _recentEventEntries: EventEntry[] = [];
   private _consoleLog: LogFile;
@@ -111,6 +141,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     this.context = context;
     this.page = page;
     this._onPageClose = onPageClose;
+    // Existing pages (e.g. when attaching to a running browser) never emit an
+    // initial framenavigated event, so seed the url from the page itself.
+    this._mainFrameUrl = page.url();
     const p = page;
     this._disposables = [
       eventsHelper.addEventListener(p, 'console', event => this._handleConsoleMessage(messageToConsoleMessage(event))),
@@ -118,6 +151,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       eventsHelper.addEventListener(p, 'request', request => this._handleRequest(request)),
       eventsHelper.addEventListener(p, 'response', response => this._handleResponse(response)),
       eventsHelper.addEventListener(p, 'requestfailed', request => this._handleRequestFailed(request)),
+      eventsHelper.addEventListener(p, 'framenavigated', frame => this._handleFrameNavigated(frame)),
       eventsHelper.addEventListener(p, 'close', () => this._onClose()),
       eventsHelper.addEventListener(p, 'crash', () => { this.crashed = true; }),
       eventsHelper.addEventListener(p, 'filechooser', chooser => {
@@ -251,6 +285,126 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     const timing = request.timing();
     const wallTime = timing.responseStart + timing.startTime;
     this._addLogEntry({ type: 'request', wallTime, request });
+    this._trackPdfDocument(response);
+  }
+
+  private _trackPdfDocument(response: playwright.Response) {
+    if (!response.request().isNavigationRequest() || response.frame() !== this.page.mainFrame())
+      return;
+    const contentType = response.headers()['content-type'] ?? '';
+    // Attachments trigger a download instead of committing a navigation.
+    const disposition = response.headers()['content-disposition'] ?? '';
+    const isAttachmentPdf = isPdfContentType(contentType) && disposition.toLowerCase().startsWith('attachment');
+    if (isPdfContentType(contentType) && !disposition.toLowerCase().startsWith('attachment')) {
+      const dedicated = this._nextPdfIsDedicated;
+      this._nextPdfIsDedicated = false;
+      const restoreUrl = dedicated ? undefined : this._restoreUrl(this._mainFrameUrl);
+      this._pdf = { url: response.url(), method: response.request().method(), restoreUrl, response };
+      return;
+    }
+    if (response.request().redirectedTo())
+      return;
+    if (isAttachmentPdf) {
+      const samePdf = this._pdf && urlWithoutFragment(this._pdf.url) === urlWithoutFragment(response.url());
+      if (samePdf) {
+        this._nextPdfIsDedicated = false;
+        return;
+      }
+    }
+    this._nextPdfIsDedicated = false;
+    this._pdf = undefined;
+    this.context.clearTabCloseTarget(this);
+  }
+
+  // There is an application page to restore only when the PDF displaced a real
+  // page at a different url - a same-url replacement (e.g. a reload that now
+  // serves a PDF) consumed the application's history entry.
+  private _restoreUrl(previousUrl: string): string | undefined {
+    return previousUrl !== 'about:blank' ? previousUrl : undefined;
+  }
+
+  // A PDF response that never committed (e.g. one that triggered a download)
+  // leaves the page on its previous url - drop the stale record. Response urls
+  // have the fragment stripped while page urls keep it, so compare without it.
+  private _currentPdf(): PdfDocument | undefined {
+    if (this._pdf && urlWithoutFragment(this.page.url()) !== urlWithoutFragment(this._pdf.url))
+      this._pdf = undefined;
+    return this._pdf;
+  }
+
+  private _handleFrameNavigated(frame: playwright.Frame) {
+    if (frame !== this.page.mainFrame())
+      return;
+    this._pdfProbedUrl = undefined;
+    // The PDF navigation response arrives before the frame navigation, so a
+    // main frame navigation to any other url means the PDF is gone.
+    if (this._pdf && urlWithoutFragment(frame.url()) !== urlWithoutFragment(this._pdf.url)) {
+      this._pdf = undefined;
+      this.context.clearTabCloseTarget(this);
+    }
+    if (!this._pdf && frame.url() !== this._mainFrameUrl) {
+      this._previousMainFrameUrl = this._mainFrameUrl;
+      this._mainFrameUrl = frame.url();
+    }
+  }
+
+  async ensurePdfInNewTab(restoreDirection: 'back' | 'forward' = 'back'): Promise<void> {
+    await this._probePdfDocument();
+    const pdf = this._currentPdf();
+    if (!pdf?.restoreUrl || pdf.moveAttempted)
+      return;
+    // Blob and data documents only resolve in the tab that owns them and
+    // cannot be reproduced in another tab.
+    if (pdf.local)
+      return;
+    // Re-opening the document issues a fresh GET, so leave the results of
+    // non-idempotent requests (e.g. POST form submissions) in place.
+    if (pdf.method !== 'GET')
+      return;
+    pdf.moveAttempted = true;
+    // Keep the application page in this tab and move the PDF into a tab of its
+    // own, so that closing the PDF leaves the application unaffected.
+    // _currentPdf() guarantees the page url is the same document, and unlike
+    // the response url it keeps the fragment (e.g. #page=2).
+    const pdfUrl = this.page.url();
+    const newTab = await this.context.newTab();
+    this.context.setTabCloseTarget(newTab, this);
+    await newTab._initializedPromise.catch(e => debug('pw:tools:error')(e));
+    newTab._nextPdfIsDedicated = true;
+    await newTab.page.goto(pdfUrl, { waitUntil: 'domcontentloaded', ...this.navigationTimeoutOptions }).catch(e => debug('pw:tools:error')(e));
+    // Only give up this tab's copy once the new tab shows the same document.
+    if (newTab._currentPdf()?.url === pdf.url) {
+      // A PDF reached via the Back button displaced the page that history
+      // navigation left, which sits in the forward direction.
+      if (restoreDirection === 'forward')
+        await this.page.goForward(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
+      else
+        await this.page.goBack(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
+    }
+    if (!await this._restoredFromPdf(pdf)) {
+      // The application page could not be restored (e.g. the PDF replaced its
+      // history entry), so return to the PDF and drop the extra tab.
+      if (urlWithoutFragment(this.page.url()) !== urlWithoutFragment(pdf.url)) {
+        if (restoreDirection === 'forward')
+          await this.page.goBack(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
+        else
+          await this.page.goForward(this.navigationTimeoutOptions).catch(e => debug('pw:tools:error')(e));
+      }
+      const currentPdf = this._currentPdf();
+      if (currentPdf)
+        currentPdf.moveAttempted = true;
+      await newTab.page.close().catch(e => debug('pw:tools:error')(e));
+      return;
+    }
+    this._pdf = undefined;
+    await newTab.page.waitForLoadState('load', { timeout: 5000 }).catch(e => debug('pw:tools:error')(e));
+  }
+
+  private async _restoredFromPdf(pdf: PdfDocument): Promise<boolean> {
+    if (!pdf.restoreUrl || urlWithoutFragment(this.page.url()) !== urlWithoutFragment(pdf.restoreUrl))
+      return false;
+    const contentType = await this.page.evaluate(() => document.contentType).catch(() => undefined);
+    return contentType !== undefined && !isPdfContentType(contentType);
   }
 
   private _handleRequestFailed(request: playwright.Request) {
@@ -329,7 +483,6 @@ export class Tab extends EventEmitter<TabEventsInterface> {
 
   async navigate(url: string) {
     await this._initializedPromise;
-
     this._clearCollectedArtifacts();
 
     const { promise: downloadEvent, abort: abortDownloadEvent } = eventWaiter<playwright.Download>(this.page, 'download', 3000);
@@ -354,6 +507,7 @@ export class Tab extends EventEmitter<TabEventsInterface> {
 
     // Cap load event to 5 seconds, the page is operational at this point.
     await this.waitForLoadState('load', { timeout: 5000 });
+    await this.ensurePdfInNewTab();
   }
 
   async consoleMessageCount(): Promise<{ total: number, errors: number, warnings: number }> {
@@ -406,10 +560,24 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     this._requests.length = 0;
   }
 
-  async captureSnapshot(root: playwright.Locator | undefined, depth: number | undefined, boxes: boolean | undefined, relativeTo: string | undefined): Promise<TabSnapshot> {
+  async captureSnapshot(root: playwright.Locator | undefined, depth: number | undefined, boxes: boolean | undefined, relativeTo: string | undefined, signal?: AbortSignal, skipPdfCapture?: boolean): Promise<TabSnapshot> {
     await this._initializedPromise;
+    throwIfAborted(signal);
     let tabSnapshot: TabSnapshot | undefined;
     const modalStates = await this._raceAgainstModalStates(async () => {
+      await this._probePdfDocument();
+      const pdf = this._currentPdf();
+      if (pdf) {
+        tabSnapshot = {
+          ariaSnapshot: '',
+          modalStates: [],
+          events: [],
+          // When the response will not include a snapshot, do not fetch the
+          // document - only report what was already captured.
+          pdf: skipPdfCapture ? { url: pdf.url, file: pdf.file, dedicatedTab: !pdf.restoreUrl } : await this._capturePdf(pdf, signal),
+        };
+        return;
+      }
       const ariaSnapshot = root
         ? await root.ariaSnapshot({ mode: 'ai', depth, boxes })
         : await this.page.ariaSnapshot({ mode: 'ai', depth, boxes });
@@ -430,6 +598,135 @@ export class Tab extends EventEmitter<TabEventsInterface> {
       modalStates,
       events: [],
     };
+  }
+
+  // Blob and data urls never produce a network response, and pages that were
+  // already open when attaching produced theirs before we listened - probe the
+  // document itself, once per url.
+  private async _probePdfDocument() {
+    if (this._pdf)
+      return;
+    const url = this.page.url();
+    if (url === 'about:blank' || this._pdfProbedUrl === url)
+      return;
+    this._pdfProbedUrl = url;
+    const contentType = await this.page.evaluate(() => document.contentType).catch(() => undefined);
+    if (contentType === 'application/pdf' && this.page.url() === url) {
+      const local = isLocalPdfUrl(url);
+      const restoreUrl = this._restoreUrl(this._previousMainFrameUrl);
+      this._pdf = { url, method: 'GET', restoreUrl, local };
+    }
+  }
+
+  private async _capturePdf(pdf: PdfDocument, signal?: AbortSignal): Promise<PdfSnapshot> {
+    const dedicatedTab = !pdf.restoreUrl;
+    throwIfAborted(signal);
+    // Saving re-issues the request, which cannot reproduce non-GET results.
+    if (!pdf.local && pdf.method !== 'GET')
+      return { url: pdf.url, error: `The document was produced by a ${pdf.method} request and cannot be re-fetched for saving.`, dedicatedTab };
+    // The output budget cleanup of a later response may have removed the file.
+    if (pdf.file && !await fs.promises.access(pdf.file).then(() => true, () => false))
+      pdf.file = undefined;
+    if (!pdf.file) {
+      let file = await this.context.outputFile({
+        prefix: 'pdf',
+        ext: 'pdf',
+        suggestedFilename: suggestedPdfFilename(pdf.url),
+      }, { origin: 'code' });
+      let fileHandle: fs.promises.FileHandle | undefined;
+      try {
+        try {
+          fileHandle = await fs.promises.open(file, 'wx');
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== 'EEXIST')
+            throw e;
+          const baseName = suggestedPdfFilename(pdf.url)?.replace(/\.pdf$/i, '') ?? 'pdf';
+          file = await this.context.outputFile({ prefix: 'pdf', ext: 'pdf', suggestedFilename: `${baseName}-${createGuid()}.pdf` }, { origin: 'code' });
+          fileHandle = await fs.promises.open(file, 'wx');
+        }
+        throwIfAborted(signal);
+        try {
+          await this._fetchPdf(pdf, fileHandle, signal);
+        } catch (e) {
+          if (!shouldRetryPdfFetchOutsidePage(pdf, e, signal))
+            throw e;
+          // The in-page fetch is constrained by the PDF document (e.g. its
+          // CSP) - retry from a neutral page while preserving the original
+          // request headers and streamed, abortable body handling.
+          await fileHandle.truncate(0);
+          await this._fetchPdfOutsidePage(pdf, fileHandle, signal);
+        }
+        pdf.file = file;
+      } catch (e) {
+        await fileHandle?.close().catch(() => {});
+        await fs.promises.unlink(file).catch(() => {});
+        debug('pw:tools:error')(e);
+        return { url: pdf.url, error: e instanceof Error ? e.message : String(e), dedicatedTab };
+      } finally {
+        await fileHandle?.close().catch(() => {});
+      }
+    }
+    return { url: pdf.url, file: pdf.file, dedicatedTab };
+  }
+
+  // In-page fetch() is not permitted on the file: scheme, so read the
+  // permitted local file directly.
+  private async _readPdfFromFile(fileUrl: string, fileHandle: fs.promises.FileHandle): Promise<void> {
+    if (!this.context.config.allowUnrestrictedFileAccess)
+      throw new Error(`Access to "file:" protocol is blocked. Attempted URL: "${fileUrl}"`);
+    const filePath = fileURLToPath(urlWithoutFragment(fileUrl));
+    for await (const chunk of fs.createReadStream(filePath))
+      await fileHandle.write(chunk as Buffer);
+  }
+
+  private async _fetchPdfOutsidePage(pdf: PdfDocument, fileHandle: fs.promises.FileHandle, signal?: AbortSignal): Promise<void> {
+    throwIfAborted(signal);
+    const page = await this.page.context().newPage();
+    try {
+      await Tab.forPage(page)?.waitForInitialized().catch(e => debug('pw:tools:error')(e));
+      // Load an inert document on the PDF's own origin so the capture fetch is
+      // same-origin - it needs no CORS and is free of the PDF document's own
+      // CSP. Credentialed cross-origin fetches from an opaque about:blank
+      // origin are rejected, so only fall back to that (with CORS injection)
+      // when the origin document cannot be loaded.
+      const pdfOrigin = originOf(pdf.url);
+      let corsOrigin: string | undefined;
+      if (pdfOrigin)
+        await page.goto(pdfOrigin, { waitUntil: 'commit' }).catch(e => debug('pw:tools:error')(e));
+      if (!pdfOrigin || originOf(page.url()) !== pdfOrigin) {
+        await page.goto('about:blank').catch(e => debug('pw:tools:error')(e));
+        corsOrigin = new URL(page.url()).origin;
+      }
+      throwIfAborted(signal);
+      await this._fetchPdf(pdf, fileHandle, signal, page, corsOrigin);
+    } finally {
+      await page.close().catch(() => {});
+    }
+  }
+
+  private async _fetchPdf(
+    pdf: PdfDocument,
+    fileHandle: fs.promises.FileHandle,
+    signal?: AbortSignal,
+    page: playwright.Page = this.page,
+    corsOrigin?: string,
+  ): Promise<void> {
+    if (pdf.url.startsWith('file:')) {
+      await this._readPdfFromFile(pdf.url, fileHandle);
+      return;
+    }
+    await capturePdf({
+      page,
+      url: pdf.url,
+      response: pdf.response,
+      local: pdf.local,
+      timeout: this.actionTimeoutOptions.timeout,
+      signal,
+      write: async chunk => { await fileHandle.write(chunk); },
+      checkNetworkUrlAllowed: url => this.context.checkNetworkUrlAllowed(url),
+      onInternalRequests: requests => this._requests = this._requests.filter(request => !requests.has(request)),
+      corsOrigin,
+    });
   }
 
   private _javaScriptBlocked(): boolean {
@@ -583,9 +880,46 @@ const tabSymbol = Symbol('tabSymbol');
 function sanitizeForFilePath(s: string) {
   const sanitize = (s: string) => s.replace(/[\x00-\x2C\x2E-\x2F\x3A-\x40\x5B-\x60\x7B-\x7F]+/g, '-');
   const separator = s.lastIndexOf('.');
-  if (separator === -1)
-    return sanitize(s);
-  return sanitize(s.substring(0, separator)) + '.' + sanitize(s.substring(separator + 1));
+  const result = separator === -1 ? sanitize(s) : sanitize(s.substring(0, separator)) + '.' + sanitize(s.substring(separator + 1));
+  const stem = result.split('.', 1)[0];
+  return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem) ? `_${result}` : result;
+}
+
+// Returns a same-origin navigable origin (http/https only), or undefined.
+function originOf(url: string): string | undefined {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+      return parsed.origin;
+  } catch {
+  }
+  return undefined;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted)
+    return;
+  if (signal?.reason instanceof Error)
+    throw signal.reason;
+  throw new Error('The PDF capture operation was aborted');
+}
+
+// Server responses, policy violations and cancellations are authoritative -
+// only retry outside the page when the in-page request could not be issued at
+// all (e.g. rejected by the document before hitting the network).
+function shouldRetryPdfFetchOutsidePage(pdf: PdfDocument, error: unknown, signal?: AbortSignal): boolean {
+  if (pdf.local || signal?.aborted)
+    return false;
+  if (!pdf.url.startsWith('http:') && !pdf.url.startsWith('https:'))
+    return false;
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith('Failed to read the PDF content:'))
+    return false;
+  if (message.includes('blocked by the network origin policy'))
+    return false;
+  if (message.includes('timed out after'))
+    return false;
+  return true;
 }
 
 function tabHeaderEquals(a: TabHeader, b: TabHeader): boolean {

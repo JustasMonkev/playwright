@@ -75,7 +75,7 @@ export class BrowserBackend implements ServerBackend {
     const cwd = rawArguments._meta?.cwd;
     const raw = !!rawArguments._meta?.raw;
     const context = this._context!;
-    const response = new Response(context, name, parsedArguments, { relativeTo: cwd, raw, json });
+    const response = new Response(context, name, parsedArguments, { relativeTo: cwd, raw, json, signal });
     context.setRunningTool(name);
     let responseObject: mcpServer.CallToolResult & { isClose?: boolean };
     try {

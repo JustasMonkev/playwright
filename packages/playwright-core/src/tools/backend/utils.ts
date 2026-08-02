@@ -19,6 +19,7 @@ import type { Tab } from './tab';
 
 export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>): Promise<R> {
   const requests: playwright.Request[] = [];
+  const historyIndex = await navigationHistoryIndex(tab);
 
   const requestListener = (request: playwright.Request) => requests.push(request);
   const disposeListeners = () => {
@@ -34,11 +35,18 @@ export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>)
     disposeListeners();
   }
 
+  // Back/forward can restore from the back-forward cache without issuing a
+  // request, so a URL change can be a navigation when no document request is
+  // issued. Keep waiting for pending requests after SPA URL changes.
   const requestedNavigation = requests.some(request => request.isNavigationRequest());
-  if (requestedNavigation) {
+  if (requestedNavigation)
     await tab.page.mainFrame().waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+  const newHistoryIndex = await navigationHistoryIndex(tab);
+  const historyChanged = historyIndex !== undefined && newHistoryIndex !== undefined && newHistoryIndex !== historyIndex;
+  if (requestedNavigation || historyChanged)
+    await tab.ensurePdfInNewTab(historyIndex !== undefined && newHistoryIndex !== undefined && newHistoryIndex < historyIndex ? 'forward' : 'back');
+  if (requestedNavigation)
     return result;
-  }
 
   const promises: Promise<any>[] = [];
   for (const request of requests) {
@@ -53,6 +61,20 @@ export async function waitForCompletion<R>(tab: Tab, callback: () => Promise<R>)
     await tab.waitForTimeout(500);
 
   return result;
+}
+
+async function navigationHistoryIndex(tab: Tab): Promise<number | undefined> {
+  const evaluateTimeout = new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 500));
+  const navigation = await Promise.race([
+    tab.page.evaluate(() => {
+      const navigation = (globalThis as typeof globalThis & { navigation?: { currentEntry?: { index?: number } } }).navigation;
+      return navigation?.currentEntry?.index;
+    }).catch(() => undefined),
+    evaluateTimeout
+  ]);
+  if (typeof navigation !== 'number')
+    return undefined;
+  return navigation;
 }
 
 export function eventWaiter<T>(page: playwright.Page, event: string, timeout: number): { promise: Promise<T | undefined>, abort: () => void } {

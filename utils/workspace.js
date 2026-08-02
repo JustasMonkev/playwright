@@ -122,6 +122,8 @@ class Workspace {
           pkg.packageJSON.dependencies[otherPackage.name] = version;
         if (pkg.packageJSON.devDependencies && pkg.packageJSON.devDependencies[otherPackage.name])
           pkg.packageJSON.devDependencies[otherPackage.name] = version;
+        if (pkg.packageJSON.peerDependencies && pkg.packageJSON.peerDependencies[otherPackage.name])
+          pkg.packageJSON.peerDependencies[otherPackage.name] = version;
       }
       await maybeWriteJSON(pkg.packageJSONPath, pkg.packageJSON);
     }
@@ -151,6 +153,11 @@ const workspace = new Workspace(ROOT_PATH, [
   new PWPackage({
     name: 'playwright-core',
     path: path.join(ROOT_PATH, 'packages', 'playwright-core'),
+    files: LICENCE_FILES,
+  }),
+  new PWPackage({
+    name: '@playwright/pdf',
+    path: path.join(ROOT_PATH, 'packages', 'playwright-pdf'),
     files: LICENCE_FILES,
   }),
   new PWPackage({

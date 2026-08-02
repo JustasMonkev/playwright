@@ -652,6 +652,7 @@ steps.push(new EsbuildStep({
     'electron/*',
     'chromium-bidi',
     'chromium-bidi/*',
+    '@playwright/pdf',
     'mitt',
   ],
   // HMR: baked-in flag that enables the embedded Vite dev server for the

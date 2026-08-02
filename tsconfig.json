@@ -24,6 +24,7 @@
       "playwright-core/lib/*": ["./packages/playwright-core/src/*"],
       "playwright/lib/*": ["./packages/playwright/src/*"],
       "@playwright/*": ["./packages/playwright/src/*"],
+      "@playwright/pdf": ["./packages/playwright-pdf/src/index.ts"],
     },
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
